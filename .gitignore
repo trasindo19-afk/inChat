@@ -5,7 +5,39 @@ frontend/dist/assets/
 # Wails generated output
 build/bin/
 build/app/
-build/windows/
+build/windows/*
+!build/windows/installer
+build/windows/installer/*
+!build/windows/installer/project.nsi
+!build/windows/icon.ico*
+!build/windows/installer
+build/windows/installer/*
+!build/windows/installer/project.nsi
+!build/windows/icon.ico*
+!build/windows/installer
+build/windows/installer/*
+!build/windows/installer/project.nsi
+!build/windows/icon.ico*
+!build/windows/installer
+build/windows/installer/*
+!build/windows/installer/project.nsi
+!build/windows/icon.ico*
+!build/windows/installer
+build/windows/installer/*
+!build/windows/installer/project.nsi
+!build/windows/icon.ico*
+!build/windows/installer
+build/windows/installer/*
+!build/windows/installer/project.nsi
+!build/windows/icon.ico*
+!build/windows/installer
+build/windows/installer/*
+!build/windows/installer/project.nsi
+!build/windows/icon.ico*
+!build/windows/installer
+build/windows/installer/*
+!build/windows/installer/project.nsi
+!build/windows/icon.ico
 
 # Wails generated bindings
 frontend/wailsjs/

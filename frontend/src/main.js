@@ -1,4 +1,5 @@
 import './style.css';
+import appIcon from './inchat.png';
 
 const state = {
   identity: null,
@@ -54,6 +55,7 @@ async function callApp(method, ...args) {
 }
 
 async function init() {
+  $('app-brand-icon').src = appIcon;
   bindEvents();
   try {
     state.identity = await callApp('GetIdentity');
@@ -66,6 +68,10 @@ async function init() {
     $('network-status').textContent = 'Backend unavailable';
     showToast(error.message, 6000);
   }
+
+  window.matchMedia?.('(prefers-color-scheme: light)').addEventListener?.('change', () => {
+    if (state.settings?.theme === 'system') applyTheme('system');
+  });
 
   if (window.runtime?.EventsOn) {
     window.runtime.EventsOn('peer', (peer) => updatePeer(peer));
@@ -82,6 +88,54 @@ async function init() {
 
   await refreshPeers();
   setInterval(refreshPeers, 2000);
+  refreshFirewallStatus();
+}
+
+const peerStatusLine = (peer) => {
+  switch (peer.status) {
+    case 'online': return 'online';
+    case 'connecting': return 'connecting…';
+    case 'failed': return `failed · ${peer.lastError || 'unknown error'}`;
+    default: return 'discovered';
+  }
+};
+
+async function refreshFirewallStatus() {
+  if (!app()?.CheckFirewall) return;
+  try {
+    const result = await callApp('CheckFirewall');
+    state.firewall = result;
+    const banner = $('firewall-banner');
+    const needsAttention = result.available && !result.allowed;
+    banner.classList.toggle('hidden', !needsAttention);
+    if (needsAttention) {
+      $('firewall-banner-text').textContent = result.message;
+    }
+  } catch (_) {
+    // The banner is best-effort; never let it break startup.
+  }
+}
+
+async function allowFirewall() {
+  const button = $('firewall-allow');
+  button.disabled = true;
+  button.textContent = 'Waiting for approval…';
+  try {
+    const result = await callApp('AllowFirewall');
+    state.firewall = result;
+    if (result.allowed) {
+      $('firewall-banner').classList.add('hidden');
+      showToast('Windows Firewall is now allowing inChat.');
+    } else {
+      $('firewall-banner-text').textContent = result.message;
+      showToast('Firewall access was not granted. The banner stays visible.');
+    }
+  } catch (error) {
+    showToast(error.message, 6000);
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Allow inChat';
+  }
 }
 
 function bindEvents() {
@@ -117,6 +171,9 @@ function bindEvents() {
   $('camera-button').addEventListener('click', toggleCamera);
   $('screen-button').addEventListener('click', toggleScreenShare);
   $('hangup-button').addEventListener('click', endCall);
+  $('firewall-allow').addEventListener('click', allowFirewall);
+  $('firewall-open').addEventListener('click', () => callApp('OpenFirewallSettings').catch((error) => showToast(error.message)));
+  $('firewall-dismiss').addEventListener('click', () => $('firewall-banner').classList.add('hidden'));
 }
 
 async function refreshPeers() {
@@ -166,7 +223,7 @@ function renderPeers() {
   list.innerHTML = peers.map((peer) => `
     <button class="peer-row ${peer.id === state.selectedPeer ? 'selected' : ''}" data-peer-id="${escapeHtml(peer.id)}">
       <span class="peer-avatar">${escapeHtml(initials(peer.name))}<span class="dot ${peer.connected ? 'green' : ''}" style="position:absolute;right:-1px;bottom:1px;border:2px solid #101827"></span></span>
-      <span class="peer-copy"><strong>${escapeHtml(peer.name || 'Unknown device')}</strong><small>${peer.connected ? 'online' : 'discovered'}</small></span>
+      <span class="peer-copy"><strong>${escapeHtml(peer.name || 'Unknown device')}</strong><small class="${peer.status === 'failed' ? 'status-failed' : ''}" title="${escapeHtml(peer.lastError || '')}">${escapeHtml(peerStatusLine(peer))}</small></span>
     </button>`).join('');
   list.querySelectorAll('[data-peer-id]').forEach((button) => {
     button.addEventListener('click', () => selectPeer(button.dataset.peerId));
@@ -187,7 +244,10 @@ function updateConversationHeader() {
   $('conversation').classList.toggle('hidden', !peer);
   if (!peer) return;
   $('conversation-name').textContent = peer.name || 'Unknown device';
-  $('conversation-state').textContent = peer.connected ? 'online · direct connection' : 'discovered · connecting…';
+  const stateLine = peerStatusLine(peer);
+  $('conversation-state').textContent = peer.connected ? 'online · direct connection' : stateLine;
+  $('conversation-state').classList.toggle('state-failed', peer.status === 'failed');
+  $('conversation-state').title = peer.lastError || '';
 }
 
 function renderMessages() {
@@ -373,13 +433,29 @@ async function renameDevice() {
 }
 
 function applyAvatar(element, dataUrl) {
-  if (dataUrl) {
-    element.style.backgroundImage = `url("${dataUrl}")`;
-    element.textContent = '';
+  const image = element.querySelector('img');
+  const fallback = element.querySelector('span');
+  if (dataUrl && image) {
+    image.src = dataUrl;
+    image.hidden = false;
+    if (fallback) fallback.hidden = true;
   } else {
-    element.style.backgroundImage = '';
-    element.textContent = 'I';
+    if (image) {
+      image.removeAttribute('src');
+      image.hidden = true;
+    }
+    if (fallback) {
+      fallback.hidden = false;
+      fallback.textContent = 'I';
+    }
   }
+}
+
+function applyTheme(theme) {
+  const systemLight = window.matchMedia?.('(prefers-color-scheme: light)').matches;
+  const light = theme === 'light' || (theme === 'system' && systemLight);
+  document.body.classList.toggle('theme-light', light);
+  document.body.dataset.theme = light ? 'light' : 'dark';
 }
 
 function applySettingsToUI() {
@@ -387,6 +463,8 @@ function applySettingsToUI() {
   $('settings-display-name').value = state.settings.displayName || '';
   $('settings-receive-folder').value = state.settings.receiveFolder || '';
   $('settings-update-feed').value = state.settings.updateFeedUrl || '';
+  $('settings-theme').value = state.settings.theme || 'dark';
+  applyTheme(state.settings.theme || 'dark');
   $('auto-accept-files').checked = Boolean(state.settings.autoAcceptFiles);
   applyAvatar($('local-avatar'), state.settings.avatarData);
   applyAvatar($('settings-avatar-preview'), state.settings.avatarData);
@@ -445,9 +523,11 @@ async function saveSettings() {
     const displayName = $('settings-display-name').value.trim();
     const autoAccept = $('auto-accept-files').checked;
     const updateFeed = $('settings-update-feed').value.trim();
+    const theme = $('settings-theme').value;
     await callApp('SetDisplayName', displayName);
     await callApp('SetAutoAcceptFiles', autoAccept);
     await callApp('SetUpdateFeedURL', updateFeed);
+    await callApp('SetTheme', theme);
     state.identity.name = displayName;
     state.settings = await callApp('GetSettings');
     applySettingsToUI();
@@ -773,6 +853,7 @@ async function endCall(closePanel = true) {
 async function showDiagnostics() {
   try {
     const diagnostics = await callApp('GetDiagnostics');
+    try { diagnostics.firewall = await callApp('CheckFirewall'); } catch (_) { /* non-fatal */ }
     $('diagnostics-content').textContent = JSON.stringify(diagnostics, null, 2);
     $('diagnostics-modal').classList.remove('hidden');
   } catch (error) {

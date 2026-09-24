@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -42,6 +43,12 @@ const (
 	appVersion    = "0.1.0"
 )
 
+const (
+	connectTimeout      = 5 * time.Second
+	peerRetryCooldown   = 3 * time.Second
+	authHandshakeWindow = 5 * time.Second
+)
+
 type Identity struct {
 	ID          string
 	Name        string
@@ -63,6 +70,7 @@ type Settings struct {
 	AvatarData      string `json:"avatarData"`
 	AvatarMIME      string `json:"avatarMime"`
 	UpdateFeedURL   string `json:"updateFeedUrl"`
+	Theme           string `json:"theme"`
 }
 
 type SettingsInfo struct {
@@ -71,6 +79,7 @@ type SettingsInfo struct {
 	AutoAcceptFiles bool   `json:"autoAcceptFiles"`
 	AvatarData      string `json:"avatarData"`
 	UpdateFeedURL   string `json:"updateFeedUrl"`
+	Theme           string `json:"theme"`
 }
 
 type UpdateInfo struct {
@@ -88,14 +97,19 @@ type PeerInfo struct {
 	Address      string    `json:"address"`
 	Fingerprint  string    `json:"fingerprint"`
 	Connected    bool      `json:"connected"`
+	Status       string    `json:"status"`
+	LastError    string    `json:"lastError,omitempty"`
 	LastSeen     time.Time `json:"lastSeen"`
 	Capabilities []string  `json:"capabilities"`
 }
 
 type peer struct {
-	info PeerInfo
-	conn *tls.Conn
-	mu   sync.Mutex
+	info        PeerInfo
+	conn        *tls.Conn
+	initiator   string
+	lastError   string
+	lastAttempt time.Time
+	mu          sync.Mutex
 }
 
 type discoveryHello struct {
@@ -201,10 +215,11 @@ type App struct {
 	quitting bool
 	tray     trayNotifier
 
-	listener   net.Listener
-	stop       chan struct{}
-	wg         sync.WaitGroup
-	connecting map[string]bool
+	listener     net.Listener
+	stop         chan struct{}
+	wg           sync.WaitGroup
+	connecting   map[string]bool
+	recentErrors []string
 }
 
 func newApp() *App {
@@ -310,6 +325,7 @@ func loadSettings() Settings {
 		DisplayName:     defaultDeviceName(),
 		ReceiveFolder:   defaultReceiveFolder(),
 		AutoAcceptFiles: false,
+		Theme:           "dark",
 	}
 	data, err := os.ReadFile(settingsPath())
 	if err == nil && json.Unmarshal(data, &settings) != nil {
@@ -320,6 +336,9 @@ func loadSettings() Settings {
 	}
 	if strings.TrimSpace(settings.ReceiveFolder) == "" {
 		settings.ReceiveFolder = defaultReceiveFolder()
+	}
+	if settings.Theme != "dark" && settings.Theme != "light" && settings.Theme != "system" {
+		settings.Theme = "dark"
 	}
 	_ = os.MkdirAll(settings.ReceiveFolder, 0700)
 	return settings
@@ -346,6 +365,7 @@ func (a *App) GetSettings() SettingsInfo {
 		AutoAcceptFiles: a.settings.AutoAcceptFiles,
 		AvatarData:      a.settings.AvatarData,
 		UpdateFeedURL:   a.settings.UpdateFeedURL,
+		Theme:           a.settings.Theme,
 	}
 }
 
@@ -478,6 +498,17 @@ func (a *App) SetAutoAcceptFiles(enabled bool) error {
 	return err
 }
 
+func (a *App) SetTheme(theme string) error {
+	if theme != "dark" && theme != "light" && theme != "system" {
+		return errors.New("theme must be dark, light, or system")
+	}
+	a.mu.Lock()
+	a.settings.Theme = theme
+	err := saveSettings(a.settings)
+	a.mu.Unlock()
+	return err
+}
+
 func (a *App) SetReceiveFolder(folder string) error {
 	folder = strings.TrimSpace(folder)
 	if folder == "" {
@@ -558,7 +589,7 @@ func loadOrCreateIdentity(name string) (Identity, error) {
 				key, parseErr := x509.ParseECPrivateKey(keyPEM.Bytes)
 				if parseErr == nil {
 					cert := tls.Certificate{Certificate: [][]byte{certPEM.Bytes}, PrivateKey: key}
-					return Identity{ID: stored.ID, Name: stored.Name, Fingerprint: stored.Fingerprint, Certificate: cert, PrivateKey: key}, nil
+					return Identity{ID: stored.ID, Name: name, Fingerprint: stored.Fingerprint, Certificate: cert, PrivateKey: key}, nil
 				}
 			}
 		}
@@ -674,27 +705,97 @@ func (a *App) GetPeers() []PeerInfo {
 
 	result := make([]PeerInfo, 0, len(a.peers))
 	for _, p := range a.peers {
-		result = append(result, p.info)
+		result = append(result, a.peerSnapshotLocked(p))
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
 }
 
+func (a *App) peerSnapshotLocked(p *peer) PeerInfo {
+	info := p.info
+	info.Connected = p.conn != nil
+	info.LastError = p.lastError
+	info.Status = peerStatus(p.conn, a.connecting[p.info.ID], p.lastError)
+	return info
+}
+
+func peerStatus(conn *tls.Conn, connecting bool, lastError string) string {
+	switch {
+	case conn != nil:
+		return "online"
+	case connecting:
+		return "connecting"
+	case lastError != "":
+		return "failed"
+	default:
+		return "discovered"
+	}
+}
+
+func preferredInitiator(localID, peerID string) string {
+	if localID < peerID {
+		return localID
+	}
+	return peerID
+}
+
+func shouldReplaceConnection(localID, peerID, existingInitiator, newInitiator string, hasConnection bool) bool {
+	if !hasConnection {
+		return true
+	}
+	preferred := preferredInitiator(localID, peerID)
+	if existingInitiator == preferred {
+		return false
+	}
+	return newInitiator == preferred
+}
+
+// recordPeerResult stores the outcome of a connection attempt and pushes the
+// updated peer snapshot to the UI. It deliberately does not raise a toast:
+// discovery retries in the background and the peer row already shows the
+// failure reason. Errors are still kept for diagnostics.
+func (a *App) recordPeerResult(peerID string, err error) {
+	a.mu.Lock()
+	p := a.peers[peerID]
+	var snapshot PeerInfo
+	if p != nil {
+		p.lastAttempt = time.Now()
+		if err != nil {
+			p.lastError = err.Error()
+		} else {
+			p.lastError = ""
+		}
+		snapshot = a.peerSnapshotLocked(p)
+	}
+	a.mu.Unlock()
+	if p != nil {
+		a.emitPeer(snapshot)
+	}
+	if err != nil {
+		// Keep a copy for the diagnostics view without spamming the UI.
+		a.mu.Lock()
+		a.recentErrors = append(a.recentErrors, fmt.Sprintf("%s: %s", time.Now().Format("15:04:05"), err.Error()))
+		if len(a.recentErrors) > 12 {
+			a.recentErrors = a.recentErrors[len(a.recentErrors)-12:]
+		}
+		a.mu.Unlock()
+	}
+}
+
+// ConnectPeer attempts to establish (or re-establish) the control channel and
+// returns the real transport error so the UI can explain what failed.
 func (a *App) ConnectPeer(peerID string) error {
 	a.mu.RLock()
 	p, ok := a.peers[peerID]
 	var info PeerInfo
 	if ok {
-		info = p.info
+		info = a.peerSnapshotLocked(p)
 	}
 	a.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("peer not found: %s", peerID)
 	}
-	if !a.startTracked(func() { _ = a.connectPeer(info) }) {
-		return errors.New("application is shutting down")
-	}
-	return nil
+	return a.connectPeer(info)
 }
 
 func (a *App) ManualConnect(address string) (PeerInfo, error) {
@@ -709,7 +810,7 @@ func (a *App) ManualConnect(address string) (PeerInfo, error) {
 	if err != nil || !isAllowedLANAddress(host) {
 		return PeerInfo{}, errors.New("enter a valid LAN IP address")
 	}
-	conn, err := tls.Dial("tcp", address, &tls.Config{
+	conn, err := a.dialTLS(address, &tls.Config{
 		InsecureSkipVerify: true, // the peer fingerprint is shown to the user for verification
 		Certificates:       []tls.Certificate{a.identity.Certificate},
 		MinVersion:         tls.VersionTLS13,
@@ -718,6 +819,10 @@ func (a *App) ManualConnect(address string) (PeerInfo, error) {
 		return PeerInfo{}, err
 	}
 	authPayload, _ := json.Marshal(map[string]string{"id": a.identity.ID, "name": a.identity.Name, "fingerprint": a.identity.Fingerprint})
+	if err := conn.SetDeadline(time.Now().Add(authHandshakeWindow)); err != nil {
+		_ = conn.Close()
+		return PeerInfo{}, err
+	}
 	if err := writeLine(conn, mustMarshalEnvelope("auth", a.identity.ID, "manual-peer", authPayload)); err != nil {
 		_ = conn.Close()
 		return PeerInfo{}, err
@@ -730,6 +835,10 @@ func (a *App) ManualConnect(address string) (PeerInfo, error) {
 			return PeerInfo{}, err
 		}
 		return PeerInfo{}, errors.New("manual peer authentication failed")
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return PeerInfo{}, err
 	}
 	var authData struct {
 		ID          string `json:"id"`
@@ -750,11 +859,24 @@ func (a *App) ManualConnect(address string) (PeerInfo, error) {
 		_ = conn.Close()
 		return PeerInfo{}, errors.New("manual peer certificate fingerprint mismatch")
 	}
-	info := PeerInfo{ID: authData.ID, Name: authData.Name, Address: address, Fingerprint: authData.Fingerprint, Connected: true, LastSeen: time.Now(), Capabilities: []string{"chat", "files", "voice", "video", "screen"}}
-	a.mu.Lock()
-	a.peers[info.ID] = &peer{info: info, conn: conn}
-	a.mu.Unlock()
-	a.emitPeer(info)
+	info := PeerInfo{ID: authData.ID, Name: authData.Name, Address: address, Fingerprint: authData.Fingerprint, Connected: true, Status: "online", LastSeen: time.Now(), Capabilities: []string{"chat", "files", "voice", "video", "screen"}}
+	// We placed this call, so we are the initiator for connection election.
+	if !a.installConnection(info, conn, a.identity.ID) {
+		_ = conn.Close()
+		a.mu.RLock()
+		existing := a.peers[info.ID]
+		snapshot := PeerInfo{}
+		if existing != nil {
+			snapshot = a.peerSnapshotLocked(existing)
+		}
+		a.mu.RUnlock()
+		if snapshot.ID != "" {
+			a.emitPeer(snapshot)
+			return snapshot, nil
+		}
+		return PeerInfo{}, errors.New("an existing peer connection is preferred")
+	}
+	a.recordPeerResult(info.ID, nil)
 	if !a.startTracked(func() { a.readLoop(info.ID, conn, reader) }) {
 		_ = conn.Close()
 		return PeerInfo{}, errors.New("application is shutting down")
@@ -973,15 +1095,35 @@ func (a *App) PickAndSendFile(peerID string) (FileTransferInfo, error) {
 
 func (a *App) GetDiagnostics() map[string]any {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
+	peerStates := make(map[string]string, len(a.peers))
+	peerErrors := make(map[string]string, len(a.peers))
+	for id, p := range a.peers {
+		peerStates[id] = peerStatus(p.conn, a.connecting[id], p.lastError)
+		if p.lastError != "" {
+			peerErrors[id] = p.lastError
+		}
+	}
+	recent := append([]string(nil), a.recentErrors...)
+	listening := a.listener != nil
+	started := a.started
+	deviceID := a.identity.ID
+	a.mu.RUnlock()
+
 	return map[string]any{
-		"protocol":  protocolVer,
-		"device_id": a.identity.ID,
-		"listen":    fmt.Sprintf("0.0.0.0:%d", controlPort),
-		"discovery": fmt.Sprintf("255.255.255.255:%d", discoveryPort),
-		"peers":     len(a.peers),
-		"started":   a.started,
-		"webview":   "Wails WebView2",
+		"protocol":       protocolVer,
+		"device_id":      deviceID,
+		"listen":         fmt.Sprintf("0.0.0.0:%d", controlPort),
+		"listening":      listening,
+		"discovery":      fmt.Sprintf("255.255.255.255:%d", discoveryPort),
+		"peers":          len(peerStates),
+		"peer_states":    peerStates,
+		"peer_errors":    peerErrors,
+		"recent_errors":  recent,
+		"local_ips":      localIPv4Addresses(),
+		"started":        started,
+		"control_port":   controlPort,
+		"discovery_port": discoveryPort,
+		"webview":        "Wails WebView2",
 	}
 }
 
@@ -989,11 +1131,42 @@ func (a *App) sendEnvelope(peerID, messageType string, payload json.RawMessage) 
 	a.mu.RLock()
 	p, ok := a.peers[peerID]
 	conn := (*tls.Conn)(nil)
+	var info PeerInfo
 	if ok {
 		conn = p.conn
+		info = p.info
 	}
 	a.mu.RUnlock()
-	if !ok || conn == nil {
+	if !ok {
+		return fmt.Errorf("peer not found: %s", peerID)
+	}
+	if conn == nil {
+		if err := a.connectPeer(info); err != nil {
+			return err
+		}
+		for i := 0; i < 20; i++ {
+			a.mu.RLock()
+			p, ok = a.peers[peerID]
+			if ok {
+				conn = p.conn
+			}
+			a.mu.RUnlock()
+			if conn != nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	if conn == nil {
+		a.mu.RLock()
+		lastError := ""
+		if p, ok := a.peers[peerID]; ok {
+			lastError = p.lastError
+		}
+		a.mu.RUnlock()
+		if lastError != "" {
+			return fmt.Errorf("peer is not connected (%s): %s", lastError, peerID)
+		}
 		return fmt.Errorf("peer is not connected: %s", peerID)
 	}
 
@@ -1009,10 +1182,59 @@ func (a *App) sendEnvelope(peerID, messageType string, payload json.RawMessage) 
 	if err != nil {
 		return err
 	}
+	a.mu.RLock()
+	p, ok = a.peers[peerID]
+	a.mu.RUnlock()
+	if !ok || p == nil {
+		return errors.New("peer connection disappeared")
+	}
 	p.mu.Lock()
 	_, err = conn.Write(append(data, '\n'))
 	p.mu.Unlock()
 	return err
+}
+
+func (a *App) dialTLS(address string, config *tls.Config) (*tls.Conn, error) {
+	dialer := &net.Dialer{Timeout: connectTimeout}
+	rawConn, err := dialer.Dial("tcp4", address)
+	if err != nil {
+		return nil, err
+	}
+	conn := tls.Client(rawConn, config)
+	if err := conn.SetDeadline(time.Now().Add(connectTimeout)); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := conn.Handshake(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (a *App) installConnection(info PeerInfo, conn *tls.Conn, initiator string) bool {
+	localID := a.identity.ID
+	a.mu.Lock()
+	existing := a.peers[info.ID]
+	hasConnection := existing != nil && existing.conn != nil
+	existingInitiator := ""
+	if existing != nil {
+		existingInitiator = existing.initiator
+	}
+	if !shouldReplaceConnection(localID, info.ID, existingInitiator, initiator, hasConnection) {
+		a.mu.Unlock()
+		return false
+	}
+	if hasConnection {
+		_ = existing.conn.Close()
+	}
+	info.Connected = true
+	info.Status = "online"
+	info.LastError = ""
+	info.LastSeen = time.Now()
+	a.peers[info.ID] = &peer{info: info, conn: conn, initiator: initiator, lastAttempt: time.Now()}
+	a.mu.Unlock()
+	return true
 }
 
 func (a *App) connectPeer(info PeerInfo) error {
@@ -1024,6 +1246,13 @@ func (a *App) connectPeer(info PeerInfo) error {
 	if p, ok := a.peers[info.ID]; ok && p.conn != nil {
 		a.mu.Unlock()
 		return nil
+	}
+	if p, ok := a.peers[info.ID]; ok && p.lastError != "" && time.Since(p.lastAttempt) < peerRetryCooldown {
+		a.mu.Unlock()
+		return nil
+	}
+	if p, ok := a.peers[info.ID]; ok {
+		p.lastAttempt = time.Now()
 	}
 	a.connecting[info.ID] = true
 	a.mu.Unlock()
@@ -1046,13 +1275,14 @@ func (a *App) connectPeer(info PeerInfo) error {
 		}
 		return nil
 	}
-	conn, err := tls.Dial("tcp", info.Address, &tls.Config{
+	conn, err := a.dialTLS(info.Address, &tls.Config{
 		InsecureSkipVerify:    true, // certificate is verified against the discovery fingerprint above
 		VerifyPeerCertificate: verify,
 		Certificates:          []tls.Certificate{a.identity.Certificate},
 		MinVersion:            tls.VersionTLS13,
 	})
 	if err != nil {
+		a.recordPeerResult(info.ID, err)
 		return err
 	}
 
@@ -1061,9 +1291,15 @@ func (a *App) connectPeer(info PeerInfo) error {
 		"name":        a.identity.Name,
 		"fingerprint": a.identity.Fingerprint,
 	})
+	if err := conn.SetDeadline(time.Now().Add(authHandshakeWindow)); err != nil {
+		_ = conn.Close()
+		a.recordPeerResult(info.ID, err)
+		return err
+	}
 	authEnvelope := mustMarshalEnvelope("auth", a.identity.ID, info.ID, authPayload)
 	if err := writeLine(conn, authEnvelope); err != nil {
 		_ = conn.Close()
+		a.recordPeerResult(info.ID, err)
 		return err
 	}
 
@@ -1071,21 +1307,26 @@ func (a *App) connectPeer(info PeerInfo) error {
 	response, err := readEnvelope(reader)
 	if err != nil || response.Type != "auth-ok" || response.From != info.ID {
 		_ = conn.Close()
-		if err != nil {
-			return err
+		if err == nil {
+			err = errors.New("peer authentication failed")
 		}
-		return errors.New("peer authentication failed")
+		a.recordPeerResult(info.ID, err)
+		return err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		a.recordPeerResult(info.ID, err)
+		return err
 	}
 
-	a.mu.Lock()
-	if old, ok := a.peers[info.ID]; ok && old.conn != nil {
-		_ = old.conn.Close()
+	if !a.installConnection(info, conn, a.identity.ID) {
+		_ = conn.Close()
+		a.recordPeerResult(info.ID, nil)
+		return nil
 	}
-	info.Connected = true
-	info.LastSeen = time.Now()
-	a.peers[info.ID] = &peer{info: info, conn: conn}
-	a.mu.Unlock()
-	a.emitPeer(info)
+	// recordPeerResult already emits the authoritative "online" snapshot; do
+	// not emit the pre-install copy afterwards or the UI would flip back.
+	a.recordPeerResult(info.ID, nil)
 
 	if !a.startTracked(func() { a.readLoop(info.ID, conn, reader) }) {
 		_ = conn.Close()
@@ -1114,6 +1355,11 @@ func (a *App) acceptLoop(listener net.Listener) {
 
 func (a *App) handleIncoming(conn *tls.Conn) {
 	defer conn.Close()
+	// Bound the authentication exchange so a stalled or firewalled peer cannot
+	// hold the handler open forever.
+	if err := conn.SetDeadline(time.Now().Add(authHandshakeWindow)); err != nil {
+		return
+	}
 	reader := bufio.NewReaderSize(conn, 64*1024)
 	auth, err := readEnvelope(reader)
 	if err != nil || auth.Type != "auth" {
@@ -1140,23 +1386,31 @@ func (a *App) handleIncoming(conn *tls.Conn) {
 
 	okPayload, _ := json.Marshal(map[string]string{"id": a.identity.ID, "name": a.identity.Name, "fingerprint": a.identity.Fingerprint})
 	_ = writeLine(conn, mustMarshalEnvelope("auth-ok", a.identity.ID, authData.ID, okPayload))
+	// Clear the authentication deadline: the long-lived readLoop must not
+	// inherit it or it would drop the connection as soon as the window expires.
+	_ = conn.SetDeadline(time.Time{})
 
-	a.mu.Lock()
+	// Store the peer's control address (host + control port) rather than the
+	// ephemeral source port, so reconnects after a drop still work.
+	address := conn.RemoteAddr().String()
+	if host, _, splitErr := net.SplitHostPort(address); splitErr == nil {
+		address = net.JoinHostPort(host, fmt.Sprintf("%d", controlPort))
+	}
 	info := PeerInfo{
 		ID:           authData.ID,
 		Name:         authData.Name,
-		Address:      conn.RemoteAddr().String(),
+		Address:      address,
 		Fingerprint:  authData.Fingerprint,
 		Connected:    true,
 		LastSeen:     time.Now(),
 		Capabilities: []string{"chat", "files", "voice", "video", "screen"},
 	}
-	if old, exists := a.peers[info.ID]; exists && old.conn != nil && old.conn != conn {
-		_ = old.conn.Close()
+	// The remote device initiated this connection, so it is the initiator used
+	// for deterministic connection election on both sides.
+	if !a.installConnection(info, conn, authData.ID) {
+		return
 	}
-	a.peers[info.ID] = &peer{info: info, conn: conn}
-	a.mu.Unlock()
-	a.emitPeer(info)
+	a.recordPeerResult(info.ID, nil)
 
 	a.readLoop(info.ID, conn, reader)
 }
@@ -1168,9 +1422,13 @@ func (a *App) readLoop(peerID string, conn *tls.Conn, reader *bufio.Reader) {
 		if current, ok := a.peers[peerID]; ok && current.conn == conn {
 			current.info.Connected = false
 			current.conn = nil
-			offline := current.info
+			current.info.LastSeen = time.Now()
+			// A clean remote close is not an error; let discovery reconnect on
+			// the next tick without surfacing a scary failure reason.
+			current.lastError = ""
+			snapshot := a.peerSnapshotLocked(current)
 			a.mu.Unlock()
-			a.emitPeer(offline)
+			a.emitPeer(snapshot)
 			return
 		}
 		a.mu.Unlock()
@@ -1440,6 +1698,20 @@ func (a *App) handleEnvelope(peerID string, message envelope) {
 	}
 }
 
+func (a *App) currentDiscoveryHello() discoveryHello {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return discoveryHello{
+		Version:      protocolVer,
+		ID:           a.identity.ID,
+		Name:         a.identity.Name,
+		Addresses:    localIPv4Addresses(),
+		Port:         controlPort,
+		Fingerprint:  a.identity.Fingerprint,
+		Capabilities: []string{"chat", "files", "voice", "video", "screen"},
+	}
+}
+
 func (a *App) discoveryLoop() {
 	defer a.wg.Done()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: discoveryPort})
@@ -1449,18 +1721,6 @@ func (a *App) discoveryLoop() {
 	}
 	defer conn.Close()
 
-	hello := discoveryHello{
-		Version:      protocolVer,
-		ID:           a.identity.ID,
-		Name:         a.identity.Name,
-		Addresses:    localIPv4Addresses(),
-		Port:         controlPort,
-		Fingerprint:  a.identity.Fingerprint,
-		Capabilities: []string{"chat", "files", "voice", "video", "screen"},
-	}
-	payload, _ := json.Marshal(hello)
-	broadcast := append(payload, '\n')
-
 	if !a.startTracked(func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
@@ -1469,7 +1729,8 @@ func (a *App) discoveryLoop() {
 			case <-a.stop:
 				return
 			case <-ticker.C:
-				_, _ = conn.WriteTo(broadcast, &net.UDPAddr{IP: net.IPv4bcast, Port: discoveryPort})
+				payload, _ := json.Marshal(a.currentDiscoveryHello())
+				_, _ = conn.WriteTo(append(payload, '\n'), &net.UDPAddr{IP: net.IPv4bcast, Port: discoveryPort})
 			}
 		}
 	}) {
@@ -1510,24 +1771,195 @@ func (a *App) discoveryLoop() {
 			LastSeen:     time.Now(),
 			Capabilities: received.Capabilities,
 		}
+		// Update the existing peer record in place so connection state,
+		// initiator, retry cooldown and last error survive each discovery tick.
 		a.mu.Lock()
-		if existing, ok := a.peers[info.ID]; ok && existing.info.Connected {
-			info.Connected = true
+		existing, exists := a.peers[info.ID]
+		if !exists {
+			existing = &peer{}
+			a.peers[info.ID] = existing
 		}
-		a.peers[info.ID] = &peer{info: info, conn: func() *tls.Conn {
-			if existing, ok := a.peers[info.ID]; ok {
-				return existing.conn
-			}
-			return nil
-		}()}
+		wasConnected := existing.conn != nil
+		info.Connected = wasConnected
+		info.Status = peerStatus(existing.conn, a.connecting[info.ID], existing.lastError)
+		info.LastError = existing.lastError
+		existing.info = info
+		snapshot := a.peerSnapshotLocked(existing)
 		a.mu.Unlock()
-		a.emitPeer(info)
-		if !info.Connected {
-			if !a.startTracked(func() { _ = a.connectPeer(info) }) {
+
+		a.emitPeer(snapshot)
+		if !snapshot.Connected {
+			if !a.startTracked(func() {
+				_ = a.connectPeer(snapshot)
+			}) {
 				return
 			}
 		}
 	}
+}
+
+// CheckFirewall reports whether Windows Firewall currently allows inbound LAN
+// traffic for inChat (discovery UDP45450 / control TCP45451) and lists the
+// active network profile so the user can compare it against the rules.
+func (a *App) CheckFirewall() map[string]any {
+	result := map[string]any{
+		"available": false,
+		"allowed":   false,
+		"port":      controlPort,
+		"udp_port":  discoveryPort,
+		"exe":       "",
+		"message":   "",
+	}
+	exe, err := os.Executable()
+	if err == nil {
+		result["exe"] = exe
+	}
+	script := firewallStatusScript(exe)
+	output, err := runPowerShell(script)
+	if err != nil {
+		result["message"] = fmt.Sprintf("could not query Windows Firewall: %s", firstLine(output, err))
+		return result
+	}
+	var parsed struct {
+		Allowed  bool     `json:"allowed"`
+		Profiles []string `json:"profiles"`
+		Rules    []struct {
+			Name    string `json:"name"`
+			Enabled bool   `json:"enabled"`
+		} `json:"rules"`
+	}
+	if json.Unmarshal(output, &parsed) != nil {
+		result["message"] = fmt.Sprintf("unexpected firewall query output: %s", firstLine(output, nil))
+		return result
+	}
+	result["available"] = true
+	result["allowed"] = parsed.Allowed
+	result["profiles"] = parsed.Profiles
+	result["rules"] = parsed.Rules
+	if parsed.Allowed {
+		result["message"] = "Windows Firewall is allowing inChat."
+	} else {
+		result["message"] = fmt.Sprintf("Windows Firewall is missing an inbound allow rule for UDP %d and TCP %d. Peers will be discovered but cannot connect.", discoveryPort, controlPort)
+	}
+	return result
+}
+
+// AllowFirewall adds the two inbound allow rules. Windows requires elevation,
+// so this triggers the standard UAC prompt; cancelling it is reported back to
+// the UI instead of failing silently.
+func (a *App) AllowFirewall() (map[string]any, error) {
+	script := firewallAllowScript()
+	if err := runPowerShellElevated(script); err != nil {
+		return a.CheckFirewall(), fmt.Errorf("Windows Firewall access was not granted: %w", err)
+	}
+	return a.CheckFirewall(), nil
+}
+
+// OpenFirewallSettings opens the built-in Windows Firewall control panel so
+// the user can review or change rules manually.
+func (a *App) OpenFirewallSettings() error {
+	return exec.Command("control.exe", "firewall.cpl").Start()
+}
+
+const firewallScriptHeader = `
+$ErrorActionPreference = 'SilentlyContinue'
+$names = @('inChat Discovery','inChat Control')
+$rules = @()
+foreach ($n in $names) {
+  foreach ($r in @(Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue)) {
+    $rules += [pscustomobject]@{ name = [string]$r.DisplayName; enabled = [bool]$r.Enabled }
+  }
+}
+`
+
+func firewallStatusScript(exe string) string {
+	exeLiteral := strings.ReplaceAll(exe, "'", "''")
+	return firewallScriptHeader + fmt.Sprintf(`
+$exe = '%s'
+foreach ($r in @(Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | ForEach-Object { $_ | Get-NetFirewallRule -ErrorAction SilentlyContinue })) {
+  if ($r.Direction.ToString() -eq 'Inbound' -and $r.Action.ToString() -eq 'Allow' -and [bool]$r.Enabled) {
+    $rules += [pscustomobject]@{ name = [string]$r.DisplayName; enabled = [bool]$r.Enabled }
+  }
+}
+$profiles = @()
+foreach ($p in @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)) { $profiles += [string]$p.NetworkCategory }
+$needed = @('inChat Discovery','inChat Control')
+$allowed = $true
+foreach ($n in $needed) {
+  $found = $false
+  foreach ($r in $rules) { if ($r.name -eq $n -and $r.enabled) { $found = $true } }
+  if (-not $found) { $allowed = $false }
+}
+[pscustomobject]@{ allowed = [bool]$allowed; profiles = $profiles; rules = $rules } | ConvertTo-Json -Depth 6 -Compress
+`, exeLiteral)
+}
+
+func firewallAllowScript() string {
+	return firewallScriptHeader + `
+$created = @()
+foreach ($pair in @(
+  @{ n = 'inChat Discovery'; p = 'UDP'; port = 45450 },
+  @{ n = 'inChat Control';   p = 'TCP'; port = 45451 }
+)) {
+  Get-NetFirewallRule -DisplayName $pair.n -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+  $rule = New-NetFirewallRule -DisplayName $pair.n -Direction Inbound -Action Allow -Enabled True -Profile Any -Protocol $pair.p -LocalPort $pair.port
+  $created += [string]$rule.DisplayName
+}
+Write-Output ('OK ' + ($created -join ', '))
+`
+}
+
+// runPowerShell executes a script with the signed-in user's privileges and
+// returns combined output.
+func runPowerShell(script string) ([]byte, error) {
+	encoded := base64.StdEncoding.EncodeToString([]byte(script))
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded)
+	return cmd.CombinedOutput()
+}
+
+// runPowerShellElevated runs the script through UAC elevation. The temp script
+// is written with restrictive permissions and removed afterwards.
+func runPowerShellElevated(script string) error {
+	file, err := os.CreateTemp(os.TempDir(), "inchat-firewall-*.ps1")
+	if err != nil {
+		return err
+	}
+	path := file.Name()
+	defer os.Remove(path)
+	if _, err := file.WriteString(script); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+
+	// Re-launch the script elevated: Start-Process -Verb RunAs is what shows
+	// the standard Windows UAC consent prompt.
+	command := fmt.Sprintf("Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','%s' -Verb RunAs -Wait -PassThru | ForEach-Object { $_.ExitCode }", strings.ReplaceAll(path, "'", "''"))
+	encoded := base64.StdEncoding.EncodeToString([]byte(command))
+	output, err := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", firstLine(output, err))
+	}
+	if code := strings.TrimSpace(string(output)); code != "" && code != "0" {
+		return fmt.Errorf("firewall helper exited with code %s", code)
+	}
+	return nil
+}
+
+func firstLine(output []byte, fallback error) error {
+	line := strings.TrimSpace(string(output))
+	if line == "" {
+		if fallback != nil {
+			return fallback
+		}
+		return errors.New("no output")
+	}
+	if index := strings.IndexByte(line, '\n'); index > 0 {
+		line = strings.TrimSpace(line[:index])
+	}
+	return errors.New(line)
 }
 
 func (a *App) emitPeer(info PeerInfo) {
@@ -1560,9 +1992,14 @@ func (a *App) startTracked(fn func()) bool {
 	return true
 }
 
+// mustMarshalEnvelope returns a single JSON envelope WITHOUT a trailing
+// newline. writeLine is responsible for framing the newline exactly once.
+// Appending it here as well previously produced a stray blank line after every
+// authentication frame, which made the peer's readLoop fail instantly and drop
+// the connection right after the handshake ("connecting" forever).
 func mustMarshalEnvelope(messageType, from, to string, payload []byte) []byte {
 	value, _ := json.Marshal(envelope{Version: protocolVer, Type: messageType, ID: newID(), From: from, To: to, Payload: payload})
-	return append(value, '\n')
+	return value
 }
 
 func writeLine(conn net.Conn, data []byte) error {
@@ -1571,35 +2008,42 @@ func writeLine(conn net.Conn, data []byte) error {
 }
 
 func readEnvelope(reader *bufio.Reader) (envelope, error) {
-	var data []byte
 	for {
-		fragment, err := reader.ReadSlice('\n')
-		if len(data)+len(fragment) > maxFrameSize {
-			return envelope{}, errors.New("control frame is too large")
+		var data []byte
+		for {
+			fragment, err := reader.ReadSlice('\n')
+			if len(data)+len(fragment) > maxFrameSize {
+				return envelope{}, errors.New("control frame is too large")
+			}
+			data = append(data, fragment...)
+			if err == bufio.ErrBufferFull {
+				continue
+			}
+			if err != nil {
+				return envelope{}, err
+			}
+			break
 		}
-		data = append(data, fragment...)
-		if err == bufio.ErrBufferFull {
+
+		// Tolerate blank/whitespace-only frames instead of tearing down the
+		// connection: a legacy peer may still emit an extra newline.
+		if len(bytes.TrimSpace(data)) == 0 {
 			continue
 		}
-		if err != nil {
+
+		var value envelope
+		if err := json.Unmarshal(data, &value); err != nil {
 			return envelope{}, err
 		}
-		break
+		if value.Version != protocolVer {
+			return envelope{}, errors.New("unsupported protocol version")
+		}
+		if value.From == "" || value.To == "" || value.Type == "" {
+			return envelope{}, errors.New("control envelope is incomplete")
+		}
+		return value, nil
 	}
-
-	var value envelope
-	if err := json.Unmarshal(data, &value); err != nil {
-		return envelope{}, err
-	}
-	if value.Version != protocolVer {
-		return envelope{}, errors.New("unsupported protocol version")
-	}
-	if value.From == "" || value.To == "" || value.Type == "" {
-		return envelope{}, errors.New("control envelope is incomplete")
-	}
-	return value, nil
 }
-
 func newID() string {
 	data := make([]byte, 16)
 	if _, err := io.ReadFull(rand.Reader, data); err != nil {
