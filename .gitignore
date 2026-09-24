@@ -1,0 +1,20 @@
+# Node / Vite
+node_modules/
+frontend/dist/assets/
+
+# Wails generated output
+build/bin/
+build/app/
+build/windows/
+
+# Wails generated bindings
+frontend/wailsjs/
+
+# Go
+*.test
+coverage.out
+
+# Local runtime
+*.log
+.env
+.DS_Store

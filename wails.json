@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "inChat",
+  "outputfilename": "inChat",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "inChat"
+  },
+  "info": {
+    "companyName": "inChat",
+    "productName": "inChat",
+    "productVersion": "0.1.0",
+    "copyright": "",
+    "comments": "Peer-to-peer LAN messenger"
+  }
+}
