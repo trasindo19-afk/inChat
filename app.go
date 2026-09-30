@@ -905,6 +905,102 @@ func (a *App) SendSignal(peerID, kind, data string) error {
 	return a.sendEnvelope(peerID, "signal", payload)
 }
 
+func (a *App) BroadcastMessage(text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return errors.New("message cannot be empty")
+	}
+	if len([]byte(text)) > 64*1024 {
+		return errors.New("message is too large")
+	}
+	a.mu.RLock()
+	activePeers := make([]string, 0, len(a.peers))
+	for id, p := range a.peers {
+		if p.conn != nil {
+			activePeers = append(activePeers, id)
+		}
+	}
+	a.mu.RUnlock()
+	if len(activePeers) == 0 {
+		return errors.New("no peers currently online in LAN room")
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"text": text,
+		"name": a.identity.Name,
+	})
+	var lastErr error
+	for _, peerID := range activePeers {
+		if err := a.sendEnvelope(peerID, "group-chat", payload); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+func (a *App) SendFileDirect(peerID, name, mimeType, dataBase64 string) error {
+	name = filepath.Base(strings.TrimSpace(name))
+	if name == "" || name == "." {
+		return errors.New("file name cannot be empty")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(dataBase64)
+	if err != nil {
+		return errors.New("invalid base64 file data")
+	}
+	if len(decoded) == 0 {
+		return errors.New("cannot send empty file")
+	}
+	if int64(len(decoded)) > 15*1024*1024 {
+		return errors.New("direct file exceeds maximum size (15MB); use chunked transfer for larger files")
+	}
+	payload, err := json.Marshal(filePayload{
+		Name: name,
+		Size: int64(len(decoded)),
+		MIME: mimeType,
+		Data: dataBase64,
+	})
+	if err != nil {
+		return err
+	}
+	return a.sendEnvelope(peerID, "file", payload)
+}
+
+func historyFilePath() (string, error) {
+	appData := os.Getenv("APPDATA")
+	if appData == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		appData = filepath.Join(home, "AppData", "Roaming")
+	}
+	dir := filepath.Join(appData, "inChat")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "chat_history.json"), nil
+}
+
+func (a *App) SaveChatHistory(data string) error {
+	path, err := historyFilePath()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(data), 0600)
+}
+
+func (a *App) LoadChatHistory() string {
+	path, err := historyFilePath()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+
 func (a *App) BeginFileTransfer(peerID, path string) (FileTransferInfo, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -1604,6 +1700,31 @@ func (a *App) handleEnvelope(peerID string, message envelope) {
 			a.notify("New inChat message", fmt.Sprintf("%s: %s", name, text))
 			a.emit("message", map[string]any{"peer_id": peerID, "text": text, "id": message.ID})
 		}
+	case "group-chat":
+		if len(message.Payload) > 64*1024 {
+			return
+		}
+		var payload struct {
+			Text string `json:"text"`
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(message.Payload, &payload) == nil {
+			senderName := payload.Name
+			if senderName == "" {
+				a.mu.RLock()
+				if p, ok := a.peers[peerID]; ok {
+					senderName = p.info.Name
+				}
+				a.mu.RUnlock()
+			}
+			a.notify("LAN Group Room", fmt.Sprintf("%s: %s", senderName, payload.Text))
+			a.emit("group-message", map[string]any{
+				"peer_id": peerID,
+				"name":    senderName,
+				"text":    payload.Text,
+				"id":      message.ID,
+			})
+		}
 	case "signal":
 		if len(message.Payload) > 2*1024*1024 {
 			return
@@ -1695,7 +1816,7 @@ func (a *App) handleEnvelope(peerID string, message envelope) {
 				a.emitError("file", saveErr)
 				return
 			}
-			a.emit("file", map[string]any{"peer_id": peerID, "name": filepath.Base(file.Name), "size": file.Size, "saved_path": savedPath})
+			a.emit("file", map[string]any{"peer_id": peerID, "name": filepath.Base(file.Name), "size": file.Size, "saved_path": savedPath, "mime": file.MIME, "data": file.Data})
 			return
 		}
 		a.emit("file", map[string]any{"peer_id": peerID, "name": filepath.Base(file.Name), "size": file.Size, "mime": file.MIME, "data": file.Data})
@@ -1734,7 +1855,13 @@ func (a *App) discoveryLoop() {
 				return
 			case <-ticker.C:
 				payload, _ := json.Marshal(a.currentDiscoveryHello())
-				_, _ = conn.WriteTo(append(payload, '\n'), &net.UDPAddr{IP: net.IPv4bcast, Port: discoveryPort})
+				msg := append(payload, '\n')
+				_, _ = conn.WriteTo(msg, &net.UDPAddr{IP: net.IPv4bcast, Port: discoveryPort})
+				for _, bcast := range localBroadcastAddresses() {
+					if !bcast.Equal(net.IPv4bcast) {
+						_, _ = conn.WriteTo(msg, &net.UDPAddr{IP: bcast, Port: discoveryPort})
+					}
+				}
 			}
 		}
 	}) {
@@ -2105,7 +2232,62 @@ func firstReachableAddress(addresses []string) string {
 	return ""
 }
 
+func localBroadcastAddresses() []net.IP {
+	var list []net.IP
+	seen := make(map[string]bool)
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return list
+	}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipNet.IP.To4()
+			if ip == nil {
+				continue
+			}
+			mask := ipNet.Mask
+			if len(mask) == 4 {
+				bcast := make(net.IP, 4)
+				for i := 0; i < 4; i++ {
+					bcast[i] = ip[i] | ^mask[i]
+				}
+				key := bcast.String()
+				if !seen[key] {
+					seen[key] = true
+					list = append(list, bcast)
+				}
+			}
+		}
+	}
+	return list
+}
+
 func isAllowedLANAddress(address string) bool {
 	ip := net.ParseIP(address)
-	return ip != nil && (ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLoopback())
+	if ip == nil {
+		return false
+	}
+	if ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLoopback() {
+		return true
+	}
+	// Support RFC 6598 Carrier-Grade NAT (100.64.0.0/10), commonly used in
+	// corporate intranet, enterprise VPNs, Tailscale, ZeroTier, and SD-WAN networks.
+	if ip4 := ip.To4(); ip4 != nil {
+		if ip4[0] == 100 && (ip4[1]&0xC0) == 64 {
+			return true
+		}
+	}
+	return false
 }

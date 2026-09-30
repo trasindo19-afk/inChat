@@ -97,3 +97,45 @@ func TestIdentityPersistenceRoundTrip(t *testing.T) {
 	}
 }
 
+func TestEnterpriseLANAddresses(t *testing.T) {
+	cgnatAllowed := []string{"100.64.0.1", "100.100.50.2", "100.127.255.254"}
+	for _, addr := range cgnatAllowed {
+		if !isAllowedLANAddress(addr) {
+			t.Errorf("expected enterprise/CGNAT address %s to be allowed", addr)
+		}
+	}
+	publicBlocked := []string{"100.63.255.255", "100.128.0.1", "52.96.10.1"}
+	for _, addr := range publicBlocked {
+		if isAllowedLANAddress(addr) {
+			t.Errorf("expected public address %s to be blocked", addr)
+		}
+	}
+}
+
+func TestLocalBroadcastAddressesDoesNotPanic(t *testing.T) {
+	addrs := localBroadcastAddresses()
+	// Should not panic and each returned address should have valid 4-byte IPv4 representation
+	for _, bcast := range addrs {
+		if ip4 := bcast.To4(); ip4 == nil {
+			t.Errorf("expected valid IPv4 broadcast address, got: %v", bcast)
+		}
+	}
+}
+
+func TestChatHistoryRoundTrip(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("APPDATA", tempDir)
+
+	app := &App{}
+	sampleHistory := `{"peer-1":[{"kind":"text","text":"hello peer","mine":true}]}`
+	if err := app.SaveChatHistory(sampleHistory); err != nil {
+		t.Fatalf("save chat history: %v", err)
+	}
+
+	loaded := app.LoadChatHistory()
+	if loaded != sampleHistory {
+		t.Fatalf("expected chat history %q, got %q", sampleHistory, loaded)
+	}
+}
+
+

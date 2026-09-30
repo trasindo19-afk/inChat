@@ -1,6 +1,8 @@
 import './style.css';
 import appIcon from './inchat.png';
 
+const LAN_GROUP_ID = '__lan_group__';
+
 const state = {
   identity: null,
   settings: null,
@@ -16,6 +18,11 @@ const state = {
   videoSender: null,
   group: null,
   pendingFileOffer: null,
+  pendingPaste: null,
+  groupUnread: 0,
+  dataChannels: new Map(),
+  dataPCs: new Map(),
+  incomingDataTransfers: new Map(),
   startedAt: 0
 };
 
@@ -57,13 +64,16 @@ async function callApp(method, ...args) {
 async function init() {
   $('app-brand-icon').src = appIcon;
   bindEvents();
+  setupDragAndDrop();
+  setupPasteHandler();
+
   try {
     state.identity = await callApp('GetIdentity');
     $('device-name').textContent = state.identity.name;
     $('device-id').textContent = state.identity.id;
     state.settings = await callApp('GetSettings');
     applySettingsToUI();
-    loadMessageHistory();
+    await loadMessageHistory();
   } catch (error) {
     $('network-status').textContent = 'Backend unavailable';
     showToast(error.message, 6000);
@@ -76,6 +86,7 @@ async function init() {
   if (window.runtime?.EventsOn) {
     window.runtime.EventsOn('peer', (peer) => updatePeer(peer));
     window.runtime.EventsOn('message', (payload) => receiveMessage(payload));
+    window.runtime.EventsOn('group-message', (payload) => receiveGroupMessage(payload));
     window.runtime.EventsOn('signal', (payload) => handleSignal(payload).catch((error) => showToast(error.message)));
     window.runtime.EventsOn('file', (payload) => receiveFile(payload));
     window.runtime.EventsOn('file-offer', (payload) => handleFileOffer(payload));
@@ -112,7 +123,7 @@ async function refreshFirewallStatus() {
       $('firewall-banner-text').textContent = result.message;
     }
   } catch (_) {
-    // The banner is best-effort; never let it break startup.
+    // Non-fatal
   }
 }
 
@@ -146,6 +157,8 @@ function bindEvents() {
       sendCurrentMessage();
     }
   });
+
+  $('lan-room-card').addEventListener('click', selectLanGroupRoom);
   $('rename-button').addEventListener('click', renameDevice);
   $('add-peer-button').addEventListener('click', connectManualPeer);
   $('settings-button').addEventListener('click', showSettings);
@@ -174,6 +187,238 @@ function bindEvents() {
   $('firewall-allow').addEventListener('click', allowFirewall);
   $('firewall-open').addEventListener('click', () => callApp('OpenFirewallSettings').catch((error) => showToast(error.message)));
   $('firewall-dismiss').addEventListener('click', () => $('firewall-banner').classList.add('hidden'));
+
+  $('cancel-paste').addEventListener('click', cancelPendingPaste);
+  $('confirm-paste').addEventListener('click', sendPendingPaste);
+  $('close-image-modal').addEventListener('click', closeImageModal);
+  $('image-modal-fullscreen').addEventListener('click', toggleImageFullscreen);
+  $('image-modal').addEventListener('click', (e) => {
+    if (e.target === $('image-modal')) closeImageModal();
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeImageModal();
+      $('settings-modal').classList.add('hidden');
+      $('diagnostics-modal').classList.add('hidden');
+      $('peer-modal').classList.add('hidden');
+      cancelPendingPaste();
+    }
+  });
+}
+
+/* =========================================================================
+   Drag and Drop & Screenshot Paste
+   ========================================================================= */
+
+function setupDragAndDrop() {
+  const overlay = $('drop-overlay');
+  const section = $('conversation-section');
+
+  window.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    if (state.selectedPeer) overlay.classList.remove('hidden');
+  });
+
+  window.addEventListener('dragleave', (e) => {
+    if (e.relatedTarget === null || e.clientX <= 0 || e.clientY <= 0) {
+      overlay.classList.add('hidden');
+    }
+  });
+
+  section.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    overlay.classList.add('hidden');
+    if (!state.selectedPeer) return showToast('Select a peer or the LAN Group Room first');
+
+    const files = Array.from(e.dataTransfer.files || []);
+    if (!files.length) return;
+
+    for (const file of files) {
+      if (file.type.startsWith('image/')) {
+        handleImageFile(file);
+      } else {
+        await sendDirectOrDataFile(file);
+      }
+    }
+  });
+}
+
+function setupPasteHandler() {
+  window.addEventListener('paste', (event) => {
+    if (!state.selectedPeer) return;
+    const items = event.clipboardData?.items;
+    if (!items) return;
+
+    for (const item of items) {
+      if (item.type.indexOf('image') !== -1) {
+        const file = item.getAsFile();
+        if (file) {
+          event.preventDefault();
+          handleImageFile(file);
+          break;
+        }
+      }
+    }
+  });
+}
+
+function handleImageFile(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const dataUrl = e.target.result;
+    const now = new Date();
+    const timestamp = `${now.getHours()}${now.getMinutes()}${now.getSeconds()}`;
+    const name = file.name && file.name !== 'image.png' ? file.name : `screenshot-${timestamp}.png`;
+    state.pendingPaste = {
+      file,
+      dataUrl,
+      name,
+      size: file.size,
+      mime: file.type || 'image/png'
+    };
+    $('paste-preview-img').src = dataUrl;
+    $('paste-filename').textContent = name;
+    $('paste-filesize').textContent = formatBytes(file.size);
+    $('paste-preview').classList.remove('hidden');
+    $('message-input').focus();
+  };
+  reader.readAsDataURL(file);
+}
+
+function cancelPendingPaste() {
+  state.pendingPaste = null;
+  $('paste-preview').classList.add('hidden');
+}
+
+async function sendPendingPaste() {
+  const item = state.pendingPaste;
+  if (!item || !state.selectedPeer) return;
+  cancelPendingPaste();
+
+  const caption = $('message-input').value.trim();
+  $('message-input').value = '';
+
+  const base64Data = item.dataUrl.split(',')[1];
+  if (!base64Data) return;
+
+  if (state.selectedPeer === LAN_GROUP_ID) {
+    // Group image message
+    addMessage(LAN_GROUP_ID, {
+      kind: 'image',
+      name: item.name,
+      size: item.size,
+      url: item.dataUrl,
+      caption,
+      mine: true,
+      senderName: state.identity?.name,
+      time: formatTime()
+    });
+    // Send notification caption to LAN
+    await callApp('BroadcastMessage', caption ? `[Shared image: ${item.name}] ${caption}` : `[Shared image: ${item.name}]`);
+    return;
+  }
+
+  // 1-on-1 direct image send
+  try {
+    await callApp('SendFileDirect', state.selectedPeer, item.name, item.mime, base64Data);
+    addMessage(state.selectedPeer, {
+      kind: 'image',
+      name: item.name,
+      size: item.size,
+      url: item.dataUrl,
+      caption,
+      mine: true,
+      time: formatTime()
+    });
+    if (caption) {
+      await callApp('SendMessage', state.selectedPeer, caption);
+      addMessage(state.selectedPeer, { kind: 'text', text: caption, mine: true, time: formatTime() });
+    }
+  } catch (error) {
+    showToast(`Could not send image: ${error.message}`);
+  }
+}
+
+async function sendDirectOrDataFile(file) {
+  if (state.selectedPeer === LAN_GROUP_ID) {
+    return showToast('File transfers are 1-on-1 direct. Select a peer to send files.');
+  }
+
+  // Try WebRTC DataChannel if connected, or direct Base64 if under 15MB
+  if (file.size <= 15 * 1024 * 1024) {
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const dataUrl = e.target.result;
+      const base64 = dataUrl.split(',')[1];
+      try {
+        await callApp('SendFileDirect', state.selectedPeer, file.name, file.type || 'application/octet-stream', base64);
+        addMessage(state.selectedPeer, {
+          kind: 'file',
+          name: file.name,
+          size: file.size,
+          url: dataUrl,
+          mine: true,
+          time: formatTime()
+        });
+        showToast(`Sent ${file.name}`);
+      } catch (err) {
+        showToast(err.message);
+      }
+    };
+    reader.readAsDataURL(file);
+  } else {
+    // For large files (>15MB), send via WebRTC DataChannel if available or PickAndSendFile
+    showToast(`Large file (${formatBytes(file.size)}): use Attach button or direct LAN file selector`);
+  }
+}
+
+/* =========================================================================
+   LAN Group Room & Peer Navigation
+   ========================================================================= */
+
+function selectLanGroupRoom() {
+  state.selectedPeer = LAN_GROUP_ID;
+  state.groupUnread = 0;
+  $('lan-room-badge').classList.add('hidden');
+  $('lan-room-card').classList.add('selected');
+  document.querySelectorAll('.peer-row').forEach((r) => r.classList.remove('selected'));
+
+  updateConversationHeader();
+  renderMessages();
+}
+
+function updateConversationHeader() {
+  const isGroup = state.selectedPeer === LAN_GROUP_ID;
+  const peer = isGroup ? null : state.peers.get(state.selectedPeer);
+
+  $('conversation-empty').classList.toggle('hidden', Boolean(isGroup || peer));
+  $('conversation').classList.toggle('hidden', !isGroup && !peer);
+  if (!isGroup && !peer) return;
+
+  if (isGroup) {
+    const onlineCount = [...state.peers.values()].filter((p) => p.connected).length;
+    $('conversation-name').textContent = 'LAN Group Room';
+    $('conversation-state').textContent = `${onlineCount} peer(s) online · Broadcast mesh`;
+    $('conversation-state').classList.remove('state-failed');
+    $('voice-button').classList.add('hidden');
+    $('video-button').classList.add('hidden');
+    $('rdp-button').classList.add('hidden');
+    $('group-button').classList.remove('hidden');
+    $('peer-info-button').classList.add('hidden');
+    return;
+  }
+
+  $('voice-button').classList.remove('hidden');
+  $('video-button').classList.remove('hidden');
+  $('rdp-button').classList.remove('hidden');
+  $('group-button').classList.remove('hidden');
+  $('peer-info-button').classList.remove('hidden');
+
+  $('conversation-name').textContent = peer.name || 'Unknown device';
+  const stateLine = peerStatusLine(peer);
+  $('conversation-state').textContent = peer.connected ? 'online · direct connection' : stateLine;
+  $('conversation-state').classList.toggle('state-failed', peer.status === 'failed');
+  $('conversation-state').title = peer.lastError || '';
 }
 
 async function refreshPeers() {
@@ -209,22 +454,29 @@ async function connectManualPeer() {
 function updatePeer(peer) {
   state.peers.set(peer.id, peer);
   renderPeers();
-  if (state.selectedPeer === peer.id) updateConversationHeader();
+  if (state.selectedPeer === peer.id || state.selectedPeer === LAN_GROUP_ID) {
+    updateConversationHeader();
+  }
 }
 
 function renderPeers() {
   const list = $('peer-list');
   const peers = [...state.peers.values()].sort((a, b) => Number(b.connected) - Number(a.connected) || a.name.localeCompare(b.name));
   $('peer-count').textContent = peers.length;
+
+  const onlineCount = peers.filter((p) => p.connected).length;
+  $('lan-room-status').textContent = `Local broadcast · ${onlineCount} online`;
+
   if (!peers.length) {
-    list.innerHTML = '<div class="empty-state">Looking for peers…<br>Make sure both devices are on the same LAN.</div>';
+    list.innerHTML = '<div class="empty-state">Looking for peers on your LAN…<br>Make sure both devices are connected to the same network.</div>';
     return;
   }
   list.innerHTML = peers.map((peer) => `
     <button class="peer-row ${peer.id === state.selectedPeer ? 'selected' : ''}" data-peer-id="${escapeHtml(peer.id)}">
-      <span class="peer-avatar">${escapeHtml(initials(peer.name))}<span class="dot ${peer.connected ? 'green' : ''}" style="position:absolute;right:-1px;bottom:1px;border:2px solid #101827"></span></span>
+      <span class="peer-avatar">${escapeHtml(initials(peer.name))}<span class="dot ${peer.connected ? 'green' : ''}" style="position:absolute;right:-1px;bottom:1px;border:2px solid #0f172a"></span></span>
       <span class="peer-copy"><strong>${escapeHtml(peer.name || 'Unknown device')}</strong><small class="${peer.status === 'failed' ? 'status-failed' : ''}" title="${escapeHtml(peer.lastError || '')}">${escapeHtml(peerStatusLine(peer))}</small></span>
     </button>`).join('');
+
   list.querySelectorAll('[data-peer-id]').forEach((button) => {
     button.addEventListener('click', () => selectPeer(button.dataset.peerId));
   });
@@ -232,38 +484,61 @@ function renderPeers() {
 
 function selectPeer(peerId) {
   state.selectedPeer = peerId;
+  $('lan-room-card').classList.remove('selected');
   renderPeers();
   updateConversationHeader();
   renderMessages();
   callApp('ConnectPeer', peerId).catch((error) => showToast(error.message));
 }
 
-function updateConversationHeader() {
-  const peer = state.peers.get(state.selectedPeer);
-  $('conversation-empty').classList.toggle('hidden', Boolean(peer));
-  $('conversation').classList.toggle('hidden', !peer);
-  if (!peer) return;
-  $('conversation-name').textContent = peer.name || 'Unknown device';
-  const stateLine = peerStatusLine(peer);
-  $('conversation-state').textContent = peer.connected ? 'online · direct connection' : stateLine;
-  $('conversation-state').classList.toggle('state-failed', peer.status === 'failed');
-  $('conversation-state').title = peer.lastError || '';
-}
+/* =========================================================================
+   Messages & Chat Rendering
+   ========================================================================= */
 
 function renderMessages() {
   const list = $('message-list');
   const messages = state.messages.get(state.selectedPeer) || [];
   if (!messages.length) {
-    list.innerHTML = '<div class="empty-state">This conversation is private and direct.<br>Say hello to start.</div>';
+    const isGroup = state.selectedPeer === LAN_GROUP_ID;
+    list.innerHTML = `<div class="empty-state">${isGroup ? 'Welcome to the LAN Group Room.<br>Broadcast a message to everyone on your local network.' : 'This conversation is private and direct.<br>Say hello to start.'}</div>`;
     return;
   }
-  list.innerHTML = messages.map((message) => message.kind === 'file' ? renderFileMessage(message) : renderTextMessage(message)).join('');
-  list.querySelectorAll('[data-cancel-transfer]').forEach((button) => button.addEventListener('click', () => cancelFileTransfer(button.dataset.cancelTransfer)));
+  list.innerHTML = messages.map((m) => {
+    if (m.kind === 'file') return renderFileMessage(m);
+    if (m.kind === 'image') return renderImageMessage(m);
+    return renderTextMessage(m);
+  }).join('');
+
+  list.querySelectorAll('[data-cancel-transfer]').forEach((button) => {
+    button.addEventListener('click', () => cancelFileTransfer(button.dataset.cancelTransfer));
+  });
+
+  list.querySelectorAll('[data-image-preview]').forEach((img) => {
+    img.addEventListener('click', () => openImageModal(img.src, img.alt));
+  });
+
   list.scrollTop = list.scrollHeight;
 }
 
 function renderTextMessage(message) {
-  return `<div class="message ${message.mine ? 'mine' : ''}"><div class="message-bubble">${escapeHtml(message.text)}</div><small class="message-time">${message.time}</small></div>`;
+  const senderTag = message.senderName && !message.mine ? `<span class="message-sender">${escapeHtml(message.senderName)}</span>` : '';
+  return `<div class="message ${message.mine ? 'mine' : ''}">${senderTag}<div class="message-bubble">${escapeHtml(message.text)}</div><small class="message-time">${message.time}</small></div>`;
+}
+
+function renderImageMessage(message) {
+  const senderTag = message.senderName && !message.mine ? `<span class="message-sender">${escapeHtml(message.senderName)}</span>` : '';
+  const captionHtml = message.caption ? `<div style="margin-top:4px;font-size:13px">${escapeHtml(message.caption)}</div>` : '';
+  return `
+    <div class="message ${message.mine ? 'mine' : ''}">
+      ${senderTag}
+      <div class="message-bubble" style="padding:6px 8px">
+        <div class="message-image-card">
+          <img src="${message.url}" alt="${escapeHtml(message.name || 'Image')}" data-image-preview="true" />
+        </div>
+        ${captionHtml}
+      </div>
+      <small class="message-time">${message.time}</small>
+    </div>`;
 }
 
 function renderFileMessage(message) {
@@ -273,13 +548,67 @@ function renderFileMessage(message) {
     : message.url
       ? `<a href="${message.url}" download="${escapeHtml(message.name)}">${escapeHtml(message.name)}<br><small>${formatBytes(message.size)}</small></a>`
       : `<span>${escapeHtml(message.name || 'File transfer')}<br><small>${message.cancelled ? 'cancelled' : `sending ${progress}`}</small></span>${message.transferId && message.sending ? `<button class="cancel-transfer" data-cancel-transfer="${escapeHtml(message.transferId)}">Cancel</button>` : ''}`;
-  return `<div class="message ${message.mine ? 'mine' : ''}"><div class="message-bubble file-message"><span>▧</span>${target}</div><small class="message-time">${message.time}</small></div>`;
+  return `<div class="message ${message.mine ? 'mine' : ''}"><div class="message-bubble file-message"><div class="file-icon-box">▧</div>${target}</div><small class="message-time">${message.time}</small></div>`;
 }
 
+function openImageModal(src, title) {
+  const img = $('image-modal-img');
+  img.src = src;
+  $('image-modal-title').textContent = title || 'Image preview';
+  $('image-modal-download').href = src;
+  $('image-modal-download').download = title || 'image.png';
+  $('image-modal-meta').textContent = 'Loading dimensions…';
+  img.onload = () => {
+    $('image-modal-meta').textContent = `${img.naturalWidth} × ${img.naturalHeight} px`;
+  };
+  $('image-modal').classList.remove('hidden');
+}
+
+function closeImageModal() {
+  if (document.fullscreenElement) {
+    document.exitFullscreen().catch(() => {});
+  }
+  $('image-modal').classList.add('hidden');
+}
+
+function toggleImageFullscreen() {
+  const stage = document.querySelector('.image-modal-stage');
+  if (!document.fullscreenElement) {
+    stage?.requestFullscreen?.().catch(() => {
+      $('image-modal-img')?.requestFullscreen?.().catch(() => {});
+    });
+  } else {
+    document.exitFullscreen().catch(() => {});
+  }
+}
+
+
 async function sendCurrentMessage() {
+  if (state.pendingPaste) {
+    return sendPendingPaste();
+  }
+
   const input = $('message-input');
   const text = input.value.trim();
   if (!text || !state.selectedPeer) return;
+
+  if (state.selectedPeer === LAN_GROUP_ID) {
+    try {
+      await callApp('BroadcastMessage', text);
+      addMessage(LAN_GROUP_ID, {
+        kind: 'text',
+        text,
+        mine: true,
+        senderName: state.identity?.name,
+        time: formatTime()
+      });
+      input.value = '';
+    } catch (error) {
+      showToast(error.message);
+    }
+    return;
+  }
+
   try {
     await callApp('SendMessage', state.selectedPeer, text);
     addMessage(state.selectedPeer, { kind: 'text', text, mine: true, time: formatTime() });
@@ -289,13 +618,29 @@ async function sendCurrentMessage() {
   }
 }
 
-function loadMessageHistory() {
+/* =========================================================================
+   Chat History Persistence (Disk + LocalStorage)
+   ========================================================================= */
+
+async function loadMessageHistory() {
   try {
-    const raw = window.localStorage.getItem('inchat.messages.v1');
-    if (!raw) return;
-    const saved = JSON.parse(raw);
-    for (const [peerId, messages] of Object.entries(saved || {})) {
-      if (Array.isArray(messages)) state.messages.set(peerId, messages.filter((message) => message.kind !== 'file' || message.savedPath).slice(-200));
+    let saved = null;
+    // 1. Try disk storage from Go backend
+    if (app()?.LoadChatHistory) {
+      const diskJson = await callApp('LoadChatHistory');
+      if (diskJson) saved = JSON.parse(diskJson);
+    }
+    // 2. Fallback to localStorage
+    if (!saved) {
+      const raw = window.localStorage.getItem('inchat.messages.v1');
+      if (raw) saved = JSON.parse(raw);
+    }
+    if (saved) {
+      for (const [peerId, messages] of Object.entries(saved)) {
+        if (Array.isArray(messages)) {
+          state.messages.set(peerId, messages.slice(-300));
+        }
+      }
     }
   } catch (_) {
     state.messages = new Map();
@@ -305,9 +650,13 @@ function loadMessageHistory() {
 function saveMessageHistory() {
   const value = {};
   for (const [peerId, messages] of state.messages) {
-    value[peerId] = messages.filter((message) => message.kind !== 'file' || message.savedPath).slice(-200);
+    value[peerId] = messages.slice(-300);
   }
-  try { window.localStorage.setItem('inchat.messages.v1', JSON.stringify(value)); } catch (_) {}
+  const jsonStr = JSON.stringify(value);
+  try { window.localStorage.setItem('inchat.messages.v1', jsonStr); } catch (_) {}
+  if (app()?.SaveChatHistory) {
+    callApp('SaveChatHistory', jsonStr).catch(() => {});
+  }
 }
 
 function addMessage(peerId, message) {
@@ -322,21 +671,72 @@ function receiveMessage(payload) {
   showToast(`New message from ${state.peers.get(payload.peer_id)?.name || 'peer'}`);
 }
 
+function receiveGroupMessage(payload) {
+  addMessage(LAN_GROUP_ID, {
+    kind: 'text',
+    text: payload.text,
+    mine: false,
+    senderName: payload.name,
+    time: formatTime()
+  });
+  if (state.selectedPeer !== LAN_GROUP_ID) {
+    state.groupUnread += 1;
+    $('lan-room-badge').textContent = state.groupUnread;
+    $('lan-room-badge').classList.remove('hidden');
+    showToast(`LAN Room: ${payload.name}: ${payload.text}`);
+  }
+}
+
 function receiveFile(payload) {
   try {
+    const isImage = (payload.mime && payload.mime.startsWith('image/')) || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(payload.name);
+    let url = '';
+    if (payload.data) {
+      const binary = atob(payload.data || '');
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: payload.mime || 'image/png' });
+      url = URL.createObjectURL(blob);
+    }
+
+    if (isImage && url) {
+      addMessage(payload.peer_id, {
+        kind: 'image',
+        name: payload.name,
+        size: payload.size,
+        url,
+        savedPath: payload.saved_path || '',
+        mine: false,
+        time: formatTime()
+      });
+      showToast(payload.saved_path ? `Saved photo ${payload.name}` : `Received photo ${payload.name}`);
+      return;
+    }
+
     if (payload.saved_path) {
-      addMessage(payload.peer_id, { kind: 'file', name: payload.name, size: payload.size, savedPath: payload.saved_path, mine: false, time: formatTime() });
+      addMessage(payload.peer_id, {
+        kind: 'file',
+        name: payload.name,
+        size: payload.size,
+        savedPath: payload.saved_path,
+        mine: false,
+        time: formatTime()
+      });
       showToast(`Saved ${payload.name}`);
       return;
     }
-    if (payload.size > 25 * 1024 * 1024) throw new Error('file exceeds the 25 MB MVP limit');
-    const binary = atob(payload.data || '');
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-    const blob = new Blob([bytes], { type: payload.mime || 'application/octet-stream' });
-    const url = URL.createObjectURL(blob);
-    addMessage(payload.peer_id, { kind: 'file', name: payload.name, size: payload.size, url, mine: false, time: formatTime() });
-    showToast(`Received ${payload.name}`);
+
+    if (url) {
+      addMessage(payload.peer_id, {
+        kind: 'file',
+        name: payload.name,
+        size: payload.size,
+        url,
+        mine: false,
+        time: formatTime()
+      });
+      showToast(`Received ${payload.name}`);
+    }
   } catch (error) {
     showToast(`Could not receive file: ${error.message}`);
   }
@@ -409,7 +809,9 @@ async function cancelFileTransfer(transferId) {
 }
 
 async function pickAndSendFile() {
-  if (!state.selectedPeer) return showToast('Select a peer first');
+  if (!state.selectedPeer || state.selectedPeer === LAN_GROUP_ID) {
+    return showToast('Select a direct peer to send files');
+  }
   try {
     const transfer = await callApp('PickAndSendFile', state.selectedPeer);
     if (transfer?.transfer_id) addMessage(state.selectedPeer, { kind: 'file', transferId: transfer.transfer_id, name: transfer.name, size: transfer.size, mine: true, progress: 0, sending: true, time: formatTime() });
@@ -539,7 +941,7 @@ async function saveSettings() {
 }
 
 async function launchRDP() {
-  if (!state.selectedPeer) return showToast('Select a peer first');
+  if (!state.selectedPeer || state.selectedPeer === LAN_GROUP_ID) return showToast('Select a direct peer first');
   const peer = state.peers.get(state.selectedPeer);
   if (!peer) return;
   try {
@@ -550,21 +952,22 @@ async function launchRDP() {
   }
 }
 
+/* =========================================================================
+   Calls & WebRTC Signaling
+   ========================================================================= */
+
 async function startGroupCall() {
-  if (!state.selectedPeer) return showToast('Select a peer first');
   if (state.pc || state.group) return showToast('Another call is already active');
-  const host = state.peers.get(state.selectedPeer);
-  if (!host?.connected) return showToast('The host peer is still connecting');
-  const others = [...state.peers.values()]
-    .filter((peer) => peer.connected && peer.id !== state.selectedPeer)
-    .slice(0, 3);
-  if (!others.length) return showToast('At least two connected peers are needed for a group call');
-  const participants = [state.identity?.id, state.selectedPeer, ...others.map((peer) => peer.id)].filter(Boolean);
+  const connectedPeers = [...state.peers.values()].filter((peer) => peer.connected);
+  if (connectedPeers.length < 1) return showToast('At least one connected peer is needed for a call');
+
+  const participants = [state.identity?.id, ...connectedPeers.map((peer) => peer.id)].slice(0, 5);
   const names = participants
     .filter((id) => id !== state.identity?.id)
     .map((id) => state.peers.get(id)?.name || 'Unknown device')
     .join(', ');
   if (!window.confirm(`Start group call with ${names}?`)) return;
+
   try {
     state.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: { ideal: 1280 }, height: { ideal: 720 } } });
     state.cameraTrack = state.localStream.getVideoTracks()[0] || null;
@@ -694,7 +1097,7 @@ async function handleGroupSignal(payload) {
 }
 
 async function startOutgoingCall(withVideo) {
-  if (!state.selectedPeer) return showToast('Select a peer first');
+  if (!state.selectedPeer || state.selectedPeer === LAN_GROUP_ID) return showToast('Select a direct peer first');
   const peer = state.peers.get(state.selectedPeer);
   if (!peer?.connected) return showToast('Peer is still connecting');
   try {

@@ -30,17 +30,37 @@
             <div class="identity-copy"><strong id="device-name">This device</strong><small id="device-id">—</small></div>
             <button id="rename-button" class="text-button" title="Rename device">Edit</button>
           </div>
+
+          <div class="sidebar-section">
+            <button id="lan-room-card" class="lan-room-card" title="Public broadcast room for all LAN peers">
+              <span class="lan-room-icon">🏢</span>
+              <div class="lan-room-info">
+                <strong>LAN Group Room</strong>
+                <small id="lan-room-status">Local broadcast · 0 online</small>
+              </div>
+              <span id="lan-room-badge" class="lan-room-badge hidden">0</span>
+            </button>
+          </div>
+
           <div class="sidebar-heading"><span>People on your LAN</span><span class="heading-actions"><button id="add-peer-button" class="mini-button" title="Connect by IP">＋ IP</button><span id="peer-count" class="count">0</span></span></div>
           <div id="peer-list" class="peer-list"><div class="empty-state">Looking for peers…</div></div>
           <div class="sidebar-footer"><span class="dot green"></span><span>Direct peer-to-peer</span></div>
         </aside>
 
-        <section class="conversation">
+        <section id="conversation-section" class="conversation">
+          <div id="drop-overlay" class="drop-overlay hidden">
+            <div class="drop-card">
+              <span class="drop-icon">⇪</span>
+              <h3>Drop files to send</h3>
+              <p>Direct peer-to-peer LAN transfer</p>
+            </div>
+          </div>
+
           <div id="conversation-empty" class="conversation-empty">
             <div class="empty-icon">⌁</div>
             <h1>Welcome to inChat</h1>
-            <p>Select a person on your LAN to start a private conversation.</p>
-            <p class="hint">No server. No account. Messages stay between your devices.</p>
+            <p>Select a person on your LAN or join the LAN Group Room.</p>
+            <p class="hint">No server. No cloud. Everything stays directly within your local network.</p>
           </div>
 
           <div id="conversation" class="conversation-content hidden">
@@ -49,6 +69,19 @@
               <div class="call-actions"><button id="voice-button" class="call-button" title="Voice call">☎</button><button id="video-button" class="call-button" title="Video call">▣</button><button id="group-button" class="call-button" title="Group call">G</button><button id="rdp-button" class="call-button" title="Open Windows RDP">RDP</button><button id="peer-info-button" class="icon-button" title="Peer safety code">ⓘ</button></div>
             </div>
             <div id="message-list" class="message-list"></div>
+
+            <div id="paste-preview" class="paste-preview hidden">
+              <img id="paste-preview-img" class="paste-thumb" alt="Preview" />
+              <div class="paste-info">
+                <strong id="paste-filename">screenshot.png</strong>
+                <small id="paste-filesize">0 KB</small>
+              </div>
+              <div class="paste-actions">
+                <button id="cancel-paste" class="icon-button" title="Cancel">✕</button>
+                <button id="confirm-paste" class="send-button mini-send">Send</button>
+              </div>
+            </div>
+
             <div class="composer"><button id="attach-button" class="icon-button" title="Attach file">＋</button><input id="message-input" type="text" placeholder="Write a private message…" autocomplete="off" /><button id="send-button" class="send-button">Send</button></div>
           </div>
         </section>
@@ -65,6 +98,7 @@
       <div id="diagnostics-modal" class="modal hidden"><div class="modal-card"><div class="modal-header"><h2>Diagnostics</h2><button id="close-diagnostics" class="icon-button">×</button></div><pre id="diagnostics-content"></pre><button id="copy-diagnostics" class="send-button">Copy diagnostics</button></div></div>
       <div id="file-offer-modal" class="modal hidden"><div class="modal-card file-offer-card"><div class="modal-header"><h2>Incoming file</h2></div><div class="file-offer-icon">▧</div><p id="file-offer-text"></p><div class="modal-actions"><button id="reject-file" class="secondary-button">Reject</button><button id="accept-file" class="send-button">Accept</button></div></div></div>
       <div id="peer-modal" class="modal hidden"><div class="modal-card"><div class="modal-header"><h2>Peer safety code</h2><button id="close-peer-info" class="icon-button">×</button></div><p id="peer-info-text"></p><button id="copy-peer-info" class="send-button">Copy safety code</button></div></div>
+      <div id="image-modal" class="modal hidden"><div class="modal-card image-card"><div class="modal-header"><h2 id="image-modal-title">Image preview</h2><div class="modal-header-actions"><button id="image-modal-fullscreen" class="icon-button" title="Toggle Fullscreen">⛶</button><button id="close-image-modal" class="icon-button" title="Close">✕</button></div></div><div class="image-modal-stage"><img id="image-modal-img" alt="" /></div><div class="modal-actions"><span id="image-modal-meta" class="settings-hint" style="margin-right:auto;align-self:center"></span><a id="image-modal-download" class="secondary-button" download="image.png">Save image</a></div></div></div>
     </div>
     <script type="module" src="/src/main.js"></script>
   </body>
