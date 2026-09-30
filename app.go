@@ -1031,6 +1031,22 @@ func (a *App) PingPeer(peerID string, ts int64) error {
 	return a.sendEnvelope(peerID, "ping", payload)
 }
 
+func (a *App) SendReaction(peerID, messageID, emoji string) error {
+	payload, _ := json.Marshal(map[string]string{
+		"message_id": messageID,
+		"emoji":      emoji,
+	})
+	return a.sendEnvelope(peerID, "reaction", payload)
+}
+
+func (a *App) SendPin(peerID, text string) error {
+	payload, _ := json.Marshal(map[string]string{
+		"text": text,
+	})
+	return a.sendEnvelope(peerID, "pin", payload)
+}
+
+
 
 
 func (a *App) BeginFileTransfer(peerID, path string) (FileTransferInfo, error) {
@@ -1747,6 +1763,28 @@ func (a *App) handleEnvelope(peerID string, message envelope) {
 		var pingData map[string]any
 		if json.Unmarshal(message.Payload, &pingData) == nil {
 			a.emit("pong", map[string]any{"peer_id": peerID, "data": pingData})
+		}
+	case "reaction":
+		var reaction struct {
+			MessageID string `json:"message_id"`
+			Emoji     string `json:"emoji"`
+		}
+		if json.Unmarshal(message.Payload, &reaction) == nil && reaction.MessageID != "" && reaction.Emoji != "" {
+			a.emit("reaction", map[string]any{
+				"peer_id":    peerID,
+				"message_id": reaction.MessageID,
+				"emoji":      reaction.Emoji,
+			})
+		}
+	case "pin":
+		var pinData struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(message.Payload, &pinData) == nil {
+			a.emit("pin", map[string]any{
+				"peer_id": peerID,
+				"text":    pinData.Text,
+			})
 		}
 	case "group-chat":
 		if len(message.Payload) > 64*1024 {

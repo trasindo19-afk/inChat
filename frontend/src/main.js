@@ -20,7 +20,16 @@ const state = {
   pendingFileOffer: null,
   pendingPaste: null,
   groupUnread: 0,
-  startedAt: 0
+  startedAt: 0,
+  replyingTo: null,
+  pinnedMessages: new Map(),
+  searchQuery: '',
+  searchMatches: [],
+  currentSearchIndex: -1,
+  isLocked: false,
+  appPin: '',
+  privacyShield: false,
+  activeReactionMessageId: null
 };
 
 const $ = (id) => document.getElementById(id);
@@ -200,6 +209,12 @@ function renderFormattedText(text) {
     formatted = formatted.replace(`__CODE_BLOCK_${i}__`, blockHtml);
   }
 
+  if (state.searchQuery && state.searchQuery.length >= 2) {
+    const escapedQ = state.searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(${escapedQ})`, 'gi');
+    formatted = formatted.replace(regex, '<mark class="search-highlight">$1</mark>');
+  }
+
   return formatted;
 }
 
@@ -247,9 +262,14 @@ async function init() {
     window.runtime.EventsOn('file-progress', (payload) => updateFileProgress(payload));
     window.runtime.EventsOn('file-complete', (payload) => completeFileTransfer(payload));
     window.runtime.EventsOn('file-cancelled', (payload) => cancelFileMessage(payload));
+    window.runtime.EventsOn('reaction', (payload) => handleIncomingReaction(payload));
+    window.runtime.EventsOn('pin', (payload) => handleIncomingPin(payload));
     window.runtime.EventsOn('error', (payload) => showToast(`${payload.component}: ${payload.message}`, 6000));
     window.runtime.EventsOn('status', () => setNetworkStatus(true));
   }
+
+  initDoodleCanvas();
+  loadSecuritySettings();
 
   await refreshPeers();
   setInterval(refreshPeers, 2000);
@@ -353,9 +373,75 @@ function bindEvents() {
     if (e.target === $('image-modal')) closeImageModal();
   });
 
+  // Search
+  $('search-button').addEventListener('click', toggleSearchBar);
+  $('search-close').addEventListener('click', closeSearchBar);
+  $('search-input').addEventListener('input', handleSearchInput);
+  $('search-prev').addEventListener('click', prevSearchResult);
+  $('search-next').addEventListener('click', nextSearchResult);
+  $('search-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.shiftKey ? prevSearchResult() : nextSearchResult();
+    }
+  });
+
+  // Replying
+  $('cancel-reply').addEventListener('click', cancelReply);
+
+  // Pinned Banner
+  $('pinned-banner').addEventListener('click', jumpToPinnedMessage);
+  $('unpin-button').addEventListener('click', (e) => {
+    e.stopPropagation();
+    unpinCurrentMessage();
+  });
+
+  // Doodle
+  $('doodle-button').addEventListener('click', openDoodleModal);
+  $('close-doodle').addEventListener('click', closeDoodleModal);
+  $('cancel-doodle').addEventListener('click', closeDoodleModal);
+  $('doodle-clear').addEventListener('click', clearDoodleCanvas);
+  $('send-doodle').addEventListener('click', sendDoodleSketch);
+
+  // Clipboard
+  $('clipboard-button').addEventListener('click', sendFromClipboard);
+
+  // App Lock & PIN
+  $('lock-app-button').addEventListener('click', lockApp);
+  $('unlock-button').addEventListener('click', unlockApp);
+  $('pin-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') unlockApp();
+  });
+
+  // Privacy Shield blur/focus
+  window.addEventListener('blur', handleWindowBlur);
+  window.addEventListener('focus', handleWindowFocus);
+
+  // Close reaction popover on outside click
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.reaction-popover') && !e.target.closest('[data-action="react"]')) {
+      if (state.activeReactionMessageId) {
+        state.activeReactionMessageId = null;
+        renderMessages();
+      }
+    }
+  });
+
   window.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+      e.preventDefault();
+      toggleSearchBar();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'v') {
+      e.preventDefault();
+      sendFromClipboard();
+      return;
+    }
     if (e.key === 'Escape') {
       closeImageModal();
+      closeSearchBar();
+      closeDoodleModal();
+      cancelReply();
       $('settings-modal').classList.add('hidden');
       $('diagnostics-modal').classList.add('hidden');
       $('peer-modal').classList.add('hidden');
@@ -661,6 +747,9 @@ function updateConversationHeader() {
   $('conversation').classList.toggle('hidden', !isGroup && !peer);
   if (!isGroup && !peer) return;
 
+  updatePinnedBanner();
+  cancelReply();
+
   if (isGroup) {
     const onlineCount = [...state.peers.values()].filter((p) => p.connected).length;
     $('conversation-name').textContent = 'LAN Group Room';
@@ -791,6 +880,44 @@ function selectPeer(peerId) {
    Messages & Chat Rendering
    ========================================================================= */
 
+const REACTION_EMOJIS = ['👍', '❤️', '🚀', '😂', '👀', '🎉'];
+
+function renderMessageActions(message) {
+  const isPopOpen = state.activeReactionMessageId === message.id;
+  const popover = isPopOpen
+    ? `<div class="reaction-popover">${REACTION_EMOJIS.map((e) => `<button class="reaction-choice-btn" data-reaction-choice="${e}" data-msg-id="${message.id}">${e}</button>`).join('')}</div>`
+    : '';
+
+  return `
+    <div class="message-actions">
+      <button class="action-mini-btn" title="React" data-action="react" data-msg-id="${escapeHtml(message.id || '')}">😊</button>
+      <button class="action-mini-btn" title="Reply" data-action="reply" data-msg-id="${escapeHtml(message.id || '')}">↩</button>
+      <button class="action-mini-btn" title="Pin" data-action="pin" data-msg-id="${escapeHtml(message.id || '')}">📌</button>
+      ${popover}
+    </div>`;
+}
+
+function renderQuotedPreview(message) {
+  if (!message.replyTo) return '';
+  return `
+    <div class="quoted-preview">
+      <strong>${escapeHtml(message.replyTo.sender || 'Peer')}</strong>
+      <span>${escapeHtml(message.replyTo.text || '')}</span>
+    </div>`;
+}
+
+function renderReactionsHtml(message) {
+  if (!message.reactions || Object.keys(message.reactions).length === 0) return '';
+  const pills = Object.entries(message.reactions)
+    .filter(([_, count]) => count > 0)
+    .map(([emoji, count]) => {
+      const isMine = message.myReactions?.includes(emoji);
+      return `<button class="reaction-pill ${isMine ? 'reacted' : ''}" data-react-pill="${emoji}" data-msg-id="${escapeHtml(message.id || '')}">${emoji} ${count}</button>`;
+    })
+    .join('');
+  return pills ? `<div class="reactions-container">${pills}</div>` : '';
+}
+
 function renderMessages() {
   const list = $('message-list');
   const messages = state.messages.get(state.selectedPeer) || [];
@@ -821,6 +948,41 @@ function renderMessages() {
       copyText(code);
       btn.textContent = 'Copied!';
       setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+    });
+  });
+
+  list.querySelectorAll('[data-action]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const action = btn.dataset.action;
+      const msgId = btn.dataset.msgId;
+      if (action === 'react') {
+        state.activeReactionMessageId = state.activeReactionMessageId === msgId ? null : msgId;
+        renderMessages();
+      } else if (action === 'reply') {
+        startReply(msgId);
+      } else if (action === 'pin') {
+        const msg = messages.find((x) => x.id === msgId);
+        if (msg) pinMessageText(msg.text || (msg.kind === 'image' ? '[Photo]' : msg.name || 'Pinned message'));
+      }
+    });
+  });
+
+  list.querySelectorAll('[data-reaction-choice]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const emoji = btn.dataset.reactionChoice;
+      const msgId = btn.dataset.msgId;
+      toggleReaction(msgId, emoji);
+    });
+  });
+
+  list.querySelectorAll('[data-react-pill]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const emoji = btn.dataset.reactPill;
+      const msgId = btn.dataset.msgId;
+      toggleReaction(msgId, emoji);
     });
   });
 
@@ -867,22 +1029,41 @@ function renderMessages() {
 function renderTextMessage(message) {
   const senderTag = message.senderName && !message.mine ? `<span class="message-sender">${escapeHtml(message.senderName)}</span>` : '';
   const statusCheck = message.mine ? (message.status === 'delivered' ? '<span class="delivery-status delivered">✓✓</span>' : '<span class="delivery-status">✓</span>') : '';
-  return `<div class="message ${message.mine ? 'mine' : ''}">${senderTag}<div class="message-bubble">${renderFormattedText(message.text)}</div><small class="message-time">${message.time}${statusCheck}</small></div>`;
+  const actionsHtml = renderMessageActions(message);
+  const reactionsHtml = renderReactionsHtml(message);
+  const quotedHtml = renderQuotedPreview(message);
+  return `
+    <div class="message ${message.mine ? 'mine' : ''}" data-msg-id="${escapeHtml(message.id || '')}">
+      ${actionsHtml}
+      ${senderTag}
+      <div class="message-bubble">
+        ${quotedHtml}
+        ${renderFormattedText(message.text)}
+      </div>
+      ${reactionsHtml}
+      <small class="message-time">${message.time}${statusCheck}</small>
+    </div>`;
 }
 
 function renderImageMessage(message) {
   const senderTag = message.senderName && !message.mine ? `<span class="message-sender">${escapeHtml(message.senderName)}</span>` : '';
   const captionHtml = message.caption ? `<div style="margin-top:4px;font-size:13px">${renderFormattedText(message.caption)}</div>` : '';
   const statusCheck = message.mine ? (message.status === 'delivered' ? '<span class="delivery-status delivered">✓✓</span>' : '<span class="delivery-status">✓</span>') : '';
+  const actionsHtml = renderMessageActions(message);
+  const reactionsHtml = renderReactionsHtml(message);
+  const quotedHtml = renderQuotedPreview(message);
   return `
-    <div class="message ${message.mine ? 'mine' : ''}">
+    <div class="message ${message.mine ? 'mine' : ''}" data-msg-id="${escapeHtml(message.id || '')}">
+      ${actionsHtml}
       ${senderTag}
       <div class="message-bubble" style="padding:6px 8px">
+        ${quotedHtml}
         <div class="message-image-card">
           <img src="${message.url}" alt="${escapeHtml(message.name || 'Image')}" data-image-preview="true" />
         </div>
         ${captionHtml}
       </div>
+      ${reactionsHtml}
       <small class="message-time">${message.time}${statusCheck}</small>
     </div>`;
 }
@@ -891,10 +1072,15 @@ function renderAudioMessage(message) {
   const audioId = `audio-${message.time.replace(/[^0-9]/g, '')}-${Math.random().toString(16).slice(2, 6)}`;
   const senderTag = message.senderName && !message.mine ? `<span class="message-sender">${escapeHtml(message.senderName)}</span>` : '';
   const statusCheck = message.mine ? (message.status === 'delivered' ? '<span class="delivery-status delivered">✓✓</span>' : '<span class="delivery-status">✓</span>') : '';
+  const actionsHtml = renderMessageActions(message);
+  const reactionsHtml = renderReactionsHtml(message);
+  const quotedHtml = renderQuotedPreview(message);
   return `
-    <div class="message ${message.mine ? 'mine' : ''}">
+    <div class="message ${message.mine ? 'mine' : ''}" data-msg-id="${escapeHtml(message.id || '')}">
+      ${actionsHtml}
       ${senderTag}
       <div class="message-bubble" style="padding:6px 10px">
+        ${quotedHtml}
         <div class="voice-note-bubble">
           <button class="voice-play-btn" data-voice-btn="${audioId}">▶</button>
           <div class="voice-track">
@@ -904,18 +1090,35 @@ function renderAudioMessage(message) {
           <audio src="${message.url}" data-voice-audio="${audioId}" preload="metadata"></audio>
         </div>
       </div>
+      ${reactionsHtml}
       <small class="message-time">${message.time}${statusCheck}</small>
     </div>`;
 }
 
 function renderFileMessage(message) {
   const progress = Number.isFinite(message.progress) ? `${message.progress}%` : '';
+  const speedText = message.speed ? ` · ${message.speed}` : '';
   const target = message.savedPath
     ? `<span><strong>Saved</strong><br><small>${escapeHtml(message.savedPath)}</small></span>`
     : message.url
       ? `<a href="${message.url}" download="${escapeHtml(message.name)}">${escapeHtml(message.name)}<br><small>${formatBytes(message.size)}</small></a>`
-      : `<span>${escapeHtml(message.name || 'File transfer')}<br><small>${message.cancelled ? 'cancelled' : `sending ${progress}`}</small></span>${message.transferId && message.sending ? `<button class="cancel-transfer" data-cancel-transfer="${escapeHtml(message.transferId)}">Cancel</button>` : ''}`;
-  return `<div class="message ${message.mine ? 'mine' : ''}"><div class="message-bubble file-message"><div class="file-icon-box">▧</div>${target}</div><small class="message-time">${message.time}</small></div>`;
+      : `<span>${escapeHtml(message.name || 'File transfer')}<br><small>${message.cancelled ? 'cancelled' : `sending ${progress}${speedText}`}</small></span>${message.transferId && message.sending ? `<button class="cancel-transfer" data-cancel-transfer="${escapeHtml(message.transferId)}">Cancel</button>` : ''}`;
+  const senderTag = message.senderName && !message.mine ? `<span class="message-sender">${escapeHtml(message.senderName)}</span>` : '';
+  const actionsHtml = renderMessageActions(message);
+  const reactionsHtml = renderReactionsHtml(message);
+  const quotedHtml = renderQuotedPreview(message);
+  return `
+    <div class="message ${message.mine ? 'mine' : ''}" data-msg-id="${escapeHtml(message.id || '')}">
+      ${actionsHtml}
+      ${senderTag}
+      <div class="message-bubble file-message">
+        ${quotedHtml}
+        <div class="file-icon-box">▧</div>
+        ${target}
+      </div>
+      ${reactionsHtml}
+      <small class="message-time">${message.time}</small>
+    </div>`;
 }
 
 function openImageModal(src, title) {
@@ -959,14 +1162,18 @@ async function sendCurrentMessage() {
   if (!text || !state.selectedPeer) return;
 
   const msgId = `m-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const replyTo = state.replyingTo;
+  cancelReply();
 
   if (state.selectedPeer === LAN_GROUP_ID) {
     try {
-      await callApp('BroadcastMessage', text);
+      const outgoingText = replyTo ? `[Replying to ${replyTo.sender}: "${replyTo.text.slice(0, 50)}"]\n${text}` : text;
+      await callApp('BroadcastMessage', outgoingText);
       addMessage(LAN_GROUP_ID, {
         id: msgId,
         kind: 'text',
         text,
+        replyTo,
         mine: true,
         senderName: state.identity?.name,
         time: formatTime()
@@ -980,8 +1187,9 @@ async function sendCurrentMessage() {
   }
 
   try {
-    await callApp('SendMessage', state.selectedPeer, text);
-    addMessage(state.selectedPeer, { id: msgId, kind: 'text', text, mine: true, status: 'sent', time: formatTime() });
+    const outgoingText = replyTo ? `[Replying to ${replyTo.sender}: "${replyTo.text.slice(0, 50)}"]\n${text}` : text;
+    await callApp('SendMessage', state.selectedPeer, outgoingText);
+    addMessage(state.selectedPeer, { id: msgId, kind: 'text', text, replyTo, mine: true, status: 'sent', time: formatTime() });
     playSentTick();
     input.value = '';
   } catch (error) {
@@ -1047,17 +1255,32 @@ function addMessage(peerId, message) {
   if (state.selectedPeer === peerId) renderMessages();
 }
 
+function parseReplyFromText(rawText) {
+  if (!rawText) return { replyTo: null, text: '' };
+  const match = rawText.match(/^\[Replying to ([^:]+): "([^"]*)"\]\n([\s\S]*)$/);
+  if (match) {
+    return {
+      replyTo: { sender: match[1], text: match[2] },
+      text: match[3]
+    };
+  }
+  return { replyTo: null, text: rawText };
+}
+
 function receiveMessage(payload) {
-  addMessage(payload.peer_id, { id: payload.id, kind: 'text', text: payload.text, mine: false, time: formatTime() });
+  const { replyTo, text } = parseReplyFromText(payload.text);
+  addMessage(payload.peer_id, { id: payload.id, kind: 'text', text, replyTo, mine: false, time: formatTime() });
   playChime();
   showToast(`New message from ${state.peers.get(payload.peer_id)?.name || 'peer'}`);
 }
 
 function receiveGroupMessage(payload) {
+  const { replyTo, text } = parseReplyFromText(payload.text);
   addMessage(LAN_GROUP_ID, {
     id: payload.id,
     kind: 'text',
-    text: payload.text,
+    text,
+    replyTo,
     mine: false,
     senderName: payload.name,
     time: formatTime()
@@ -1067,7 +1290,7 @@ function receiveGroupMessage(payload) {
     state.groupUnread += 1;
     $('lan-room-badge').textContent = state.groupUnread;
     $('lan-room-badge').classList.remove('hidden');
-    showToast(`LAN Room: ${payload.name}: ${payload.text}`);
+    showToast(`LAN Room: ${payload.name}: ${text}`);
   }
 }
 
@@ -1175,8 +1398,12 @@ function findFileMessage(transferId) {
 function updateFileProgress(payload) {
   const found = findFileMessage(payload.transfer_id);
   if (!found) return;
+  if (!found.message.startTime) found.message.startTime = Date.now();
   found.message.progress = payload.total ? Math.min(100, Math.round((payload.sent / payload.total) * 100)) : 0;
   found.message.sending = true;
+  const elapsedSec = Math.max(0.2, (Date.now() - found.message.startTime) / 1000);
+  const bytesPerSec = payload.sent / elapsedSec;
+  found.message.speed = `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
   if (found.peerId === state.selectedPeer) renderMessages();
 }
 
@@ -1281,6 +1508,14 @@ async function applySettingsToUI() {
 
   applyAvatar($('local-avatar'), state.settings.avatarData);
   applyAvatar($('settings-avatar-preview'), state.settings.avatarData);
+
+  const privacyShield = window.localStorage.getItem('inchat.privacy_shield') === 'true';
+  state.privacyShield = privacyShield;
+  $('privacy-shield').checked = privacyShield;
+
+  const appPin = window.localStorage.getItem('inchat.app_pin') || '';
+  state.appPin = appPin;
+  $('settings-pin').value = appPin;
 }
 
 async function showSettings() {
@@ -1346,6 +1581,12 @@ async function saveSettings() {
     await callApp('SetTheme', theme);
 
     try { await callApp('SetAutoStart', autoStart); } catch (_) {}
+
+    state.privacyShield = $('privacy-shield').checked;
+    window.localStorage.setItem('inchat.privacy_shield', state.privacyShield ? 'true' : 'false');
+
+    state.appPin = $('settings-pin').value.trim();
+    window.localStorage.setItem('inchat.app_pin', state.appPin);
 
     state.identity.name = displayName;
     state.settings = await callApp('GetSettings');
@@ -1713,6 +1954,425 @@ function showPeerInfo() {
 
 async function copyText(text) {
   try { await navigator.clipboard.writeText(text); showToast('Copied'); } catch (_) { showToast('Could not copy text'); }
+}
+
+
+/* =========================================================================
+   In-Chat Search (Ctrl + F)
+   ========================================================================= */
+
+function toggleSearchBar() {
+  const bar = $('search-bar');
+  if (bar.classList.contains('hidden')) {
+    bar.classList.remove('hidden');
+    $('search-input').focus();
+    handleSearchInput();
+  } else {
+    closeSearchBar();
+  }
+}
+
+function closeSearchBar() {
+  $('search-bar').classList.add('hidden');
+  $('search-input').value = '';
+  state.searchQuery = '';
+  state.searchMatches = [];
+  state.currentSearchIndex = -1;
+  $('search-count').textContent = '0/0';
+  renderMessages();
+}
+
+function handleSearchInput() {
+  const q = $('search-input').value.trim();
+  state.searchQuery = q.toLowerCase();
+  renderMessages();
+  if (!q || q.length < 2) {
+    state.searchMatches = [];
+    state.currentSearchIndex = -1;
+    $('search-count').textContent = '0/0';
+    return;
+  }
+  const marks = Array.from(document.querySelectorAll('.search-highlight'));
+  state.searchMatches = marks;
+  if (marks.length > 0) {
+    state.currentSearchIndex = 0;
+    updateSearchHighlight();
+  } else {
+    state.currentSearchIndex = -1;
+    $('search-count').textContent = '0/0';
+  }
+}
+
+function updateSearchHighlight() {
+  const count = state.searchMatches.length;
+  if (count === 0) {
+    $('search-count').textContent = '0/0';
+    return;
+  }
+  state.searchMatches.forEach((m, idx) => {
+    m.classList.toggle('active', idx === state.currentSearchIndex);
+  });
+  $('search-count').textContent = `${state.currentSearchIndex + 1}/${count}`;
+  state.searchMatches[state.currentSearchIndex]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function nextSearchResult() {
+  if (!state.searchMatches.length) return;
+  state.currentSearchIndex = (state.currentSearchIndex + 1) % state.searchMatches.length;
+  updateSearchHighlight();
+}
+
+function prevSearchResult() {
+  if (!state.searchMatches.length) return;
+  state.currentSearchIndex = (state.currentSearchIndex - 1 + state.searchMatches.length) % state.searchMatches.length;
+  updateSearchHighlight();
+}
+
+/* =========================================================================
+   Pinned Messages
+   ========================================================================= */
+
+function pinMessageText(text) {
+  if (!state.selectedPeer || !text) return;
+  state.pinnedMessages.set(state.selectedPeer, text);
+  updatePinnedBanner();
+  if (state.selectedPeer !== LAN_GROUP_ID) {
+    callApp('SendPin', state.selectedPeer, text).catch(() => {});
+  }
+  showToast('Message pinned to top');
+}
+
+function unpinCurrentMessage() {
+  if (!state.selectedPeer) return;
+  state.pinnedMessages.delete(state.selectedPeer);
+  updatePinnedBanner();
+  if (state.selectedPeer !== LAN_GROUP_ID) {
+    callApp('SendPin', state.selectedPeer, '').catch(() => {});
+  }
+  showToast('Message unpinned');
+}
+
+function updatePinnedBanner() {
+  const banner = $('pinned-banner');
+  const text = state.pinnedMessages.get(state.selectedPeer);
+  if (text) {
+    $('pinned-text').textContent = text;
+    banner.classList.remove('hidden');
+  } else {
+    banner.classList.add('hidden');
+  }
+}
+
+function jumpToPinnedMessage() {
+  const text = state.pinnedMessages.get(state.selectedPeer);
+  if (!text) return;
+  const list = $('message-list');
+  const bubbles = list.querySelectorAll('.message-bubble');
+  for (const bubble of bubbles) {
+    if (bubble.textContent.includes(text)) {
+      bubble.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      bubble.style.transition = 'outline 0.2s ease';
+      bubble.style.outline = '2px solid #3b82f6';
+      setTimeout(() => { bubble.style.outline = 'none'; }, 1500);
+      break;
+    }
+  }
+}
+
+function handleIncomingPin(payload) {
+  if (payload.text) {
+    state.pinnedMessages.set(payload.peer_id, payload.text);
+  } else {
+    state.pinnedMessages.delete(payload.peer_id);
+  }
+  if (state.selectedPeer === payload.peer_id) {
+    updatePinnedBanner();
+  }
+}
+
+/* =========================================================================
+   Emoji Reactions
+   ========================================================================= */
+
+function toggleReaction(msgId, emoji) {
+  if (!state.selectedPeer) return;
+  const messages = state.messages.get(state.selectedPeer) || [];
+  const msg = messages.find((m) => m.id === msgId);
+  if (!msg) return;
+
+  if (!msg.reactions) msg.reactions = {};
+  if (!msg.myReactions) msg.myReactions = [];
+
+  const already = msg.myReactions.includes(emoji);
+  if (already) {
+    msg.myReactions = msg.myReactions.filter((e) => e !== emoji);
+    msg.reactions[emoji] = Math.max(0, (msg.reactions[emoji] || 1) - 1);
+    if (msg.reactions[emoji] === 0) delete msg.reactions[emoji];
+  } else {
+    msg.myReactions.push(emoji);
+    msg.reactions[emoji] = (msg.reactions[emoji] || 0) + 1;
+  }
+
+  state.activeReactionMessageId = null;
+  saveMessageHistory();
+  renderMessages();
+
+  if (state.selectedPeer !== LAN_GROUP_ID) {
+    callApp('SendReaction', state.selectedPeer, msgId, emoji).catch(() => {});
+  }
+}
+
+function handleIncomingReaction(payload) {
+  const messages = state.messages.get(payload.peer_id);
+  if (!messages) return;
+  const msg = messages.find((m) => m.id === payload.message_id);
+  if (!msg) return;
+
+  if (!msg.reactions) msg.reactions = {};
+  msg.reactions[payload.emoji] = (msg.reactions[payload.emoji] || 0) + 1;
+  saveMessageHistory();
+  if (state.selectedPeer === payload.peer_id) renderMessages();
+}
+
+/* =========================================================================
+   Replying & Quoting
+   ========================================================================= */
+
+function startReply(msgId) {
+  if (!state.selectedPeer) return;
+  const messages = state.messages.get(state.selectedPeer) || [];
+  const msg = messages.find((m) => m.id === msgId);
+  if (!msg) return;
+
+  const sender = msg.mine ? 'You' : (msg.senderName || state.peers.get(state.selectedPeer)?.name || 'Peer');
+  const text = msg.text || (msg.kind === 'image' ? '[Photo]' : msg.kind === 'audio' ? '[Voice memo]' : `[File: ${msg.name}]`);
+
+  state.replyingTo = { id: msgId, sender, text };
+  $('replying-to').textContent = `Replying to ${sender}`;
+  $('replying-snippet').textContent = text;
+  $('replying-banner').classList.remove('hidden');
+  $('message-input').focus();
+}
+
+function cancelReply() {
+  state.replyingTo = null;
+  $('replying-banner').classList.add('hidden');
+}
+
+/* =========================================================================
+   Mini Doodle & Quick Sketch Pad
+   ========================================================================= */
+
+let doodleCtx = null;
+let isDoodling = false;
+let currentDoodleColor = '#ef4444';
+let lastDoodleX = 0;
+let lastDoodleY = 0;
+
+function initDoodleCanvas() {
+  const canvas = $('doodle-canvas');
+  if (!canvas) return;
+  doodleCtx = canvas.getContext('2d');
+  canvas.width = 440;
+  canvas.height = 260;
+  clearDoodleCanvas();
+
+  const getPos = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    if (e.touches && e.touches[0]) {
+      return {
+        x: (e.touches[0].clientX - rect.left) * scaleX,
+        y: (e.touches[0].clientY - rect.top) * scaleY
+      };
+    }
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY
+    };
+  };
+
+  const startDraw = (e) => {
+    e.preventDefault();
+    isDoodling = true;
+    const pos = getPos(e);
+    lastDoodleX = pos.x;
+    lastDoodleY = pos.y;
+    doodleCtx.beginPath();
+    doodleCtx.arc(pos.x, pos.y, 2, 0, Math.PI * 2);
+    doodleCtx.fillStyle = currentDoodleColor;
+    doodleCtx.fill();
+  };
+
+  const draw = (e) => {
+    if (!isDoodling) return;
+    e.preventDefault();
+    const pos = getPos(e);
+    doodleCtx.beginPath();
+    doodleCtx.moveTo(lastDoodleX, lastDoodleY);
+    doodleCtx.lineTo(pos.x, pos.y);
+    doodleCtx.strokeStyle = currentDoodleColor;
+    doodleCtx.lineWidth = 3.5;
+    doodleCtx.lineCap = 'round';
+    doodleCtx.lineJoin = 'round';
+    doodleCtx.stroke();
+    lastDoodleX = pos.x;
+    lastDoodleY = pos.y;
+  };
+
+  const stopDraw = () => { isDoodling = false; };
+
+  canvas.addEventListener('mousedown', startDraw);
+  canvas.addEventListener('mousemove', draw);
+  canvas.addEventListener('mouseup', stopDraw);
+  canvas.addEventListener('mouseleave', stopDraw);
+
+  canvas.addEventListener('touchstart', startDraw, { passive: false });
+  canvas.addEventListener('touchmove', draw, { passive: false });
+  canvas.addEventListener('touchend', stopDraw);
+
+  document.querySelectorAll('.color-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.color-btn').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      currentDoodleColor = btn.dataset.color || '#ef4444';
+    });
+  });
+}
+
+function openDoodleModal() {
+  if (!state.selectedPeer) return showToast('Select a peer or the LAN Group Room first');
+  clearDoodleCanvas();
+  $('doodle-modal').classList.remove('hidden');
+}
+
+function closeDoodleModal() {
+  $('doodle-modal').classList.add('hidden');
+}
+
+function clearDoodleCanvas() {
+  const canvas = $('doodle-canvas');
+  if (doodleCtx && canvas) {
+    doodleCtx.fillStyle = '#070b13';
+    doodleCtx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+}
+
+async function sendDoodleSketch() {
+  const canvas = $('doodle-canvas');
+  if (!canvas || !state.selectedPeer) return;
+
+  const dataUrl = canvas.toDataURL('image/png');
+  const base64 = dataUrl.split(',')[1];
+  const name = `sketch-${Date.now()}.png`;
+  closeDoodleModal();
+
+  if (state.selectedPeer === LAN_GROUP_ID) {
+    addMessage(LAN_GROUP_ID, {
+      id: `m-${Date.now()}`,
+      kind: 'image',
+      name,
+      url: dataUrl,
+      size: Math.round(base64.length * 0.75),
+      mine: true,
+      senderName: state.identity?.name,
+      time: formatTime()
+    });
+    playSentTick();
+    await callApp('BroadcastMessage', `[Shared quick sketch: ${name}]`);
+    return;
+  }
+
+  try {
+    await callApp('SendFileDirect', state.selectedPeer, name, 'image/png', base64);
+    addMessage(state.selectedPeer, {
+      id: `m-${Date.now()}`,
+      kind: 'image',
+      name,
+      url: dataUrl,
+      size: Math.round(base64.length * 0.75),
+      mine: true,
+      time: formatTime()
+    });
+    playSentTick();
+    showToast('Sent quick sketch');
+  } catch (err) {
+    showToast(`Could not send sketch: ${err.message}`);
+  }
+}
+
+/* =========================================================================
+   One-Click Send Clipboard
+   ========================================================================= */
+
+async function sendFromClipboard() {
+  if (!state.selectedPeer) return showToast('Select a peer first');
+  try {
+    const text = await navigator.clipboard.readText();
+    if (!text?.trim()) return showToast('Clipboard has no text');
+    const input = $('message-input');
+    if (input.value) {
+      input.value += (input.value.endsWith(' ') ? '' : ' ') + text;
+    } else {
+      input.value = text;
+    }
+    input.focus();
+    showToast('Clipboard content pasted');
+  } catch (err) {
+    showToast(`Clipboard error: ${err.message}`);
+  }
+}
+
+/* =========================================================================
+   Privacy Shield & App Lock PIN
+   ========================================================================= */
+
+function loadSecuritySettings() {
+  state.privacyShield = window.localStorage.getItem('inchat.privacy_shield') === 'true';
+  state.appPin = window.localStorage.getItem('inchat.app_pin') || '';
+  const pinInput = $('settings-pin');
+  if (pinInput) pinInput.value = state.appPin;
+  const shieldCheckbox = $('privacy-shield');
+  if (shieldCheckbox) shieldCheckbox.checked = state.privacyShield;
+}
+
+function lockApp() {
+  if (!state.appPin) {
+    showToast('Please configure a 4-digit PIN in Settings first');
+    showSettings();
+    return;
+  }
+  state.isLocked = true;
+  document.body.classList.add('app-locked');
+  $('pin-input').value = '';
+  $('lock-modal').classList.remove('hidden');
+  setTimeout(() => $('pin-input').focus(), 60);
+}
+
+function unlockApp() {
+  const entered = $('pin-input').value.trim();
+  if (entered === state.appPin) {
+    state.isLocked = false;
+    document.body.classList.remove('app-locked');
+    $('lock-modal').classList.add('hidden');
+    $('pin-input').value = '';
+    showToast('inChat unlocked');
+  } else {
+    showToast('Incorrect PIN');
+    $('pin-input').value = '';
+    $('pin-input').focus();
+  }
+}
+
+function handleWindowBlur() {
+  if (state.privacyShield && !state.isLocked) {
+    document.body.classList.add('privacy-shield-active');
+  }
+}
+
+function handleWindowFocus() {
+  document.body.classList.remove('privacy-shield-active');
 }
 
 init();
