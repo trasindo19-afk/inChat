@@ -1000,6 +1000,38 @@ func (a *App) LoadChatHistory() string {
 	return string(data)
 }
 
+func (a *App) GetAutoStart() bool {
+	exePath, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	out, err := runPowerShell("(Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -ErrorAction SilentlyContinue).inChat")
+	if err != nil || len(bytes.TrimSpace(out)) == 0 {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(out)), strings.ToLower(filepath.Base(exePath)))
+}
+
+func (a *App) SetAutoStart(enabled bool) error {
+	if enabled {
+		exePath, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		cmd := fmt.Sprintf("Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'inChat' -Value '\"%s\"'", exePath)
+		_, err = runPowerShell(cmd)
+		return err
+	}
+	_, err := runPowerShell("Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'inChat' -ErrorAction SilentlyContinue")
+	return err
+}
+
+func (a *App) PingPeer(peerID string, ts int64) error {
+	payload, _ := json.Marshal(map[string]any{"ts": ts})
+	return a.sendEnvelope(peerID, "ping", payload)
+}
+
+
 
 func (a *App) BeginFileTransfer(peerID, path string) (FileTransferInfo, error) {
 	info, err := os.Stat(path)
@@ -1699,6 +1731,22 @@ func (a *App) handleEnvelope(peerID string, message envelope) {
 			a.mu.RUnlock()
 			a.notify("New inChat message", fmt.Sprintf("%s: %s", name, text))
 			a.emit("message", map[string]any{"peer_id": peerID, "text": text, "id": message.ID})
+			ackPayload, _ := json.Marshal(map[string]string{"id": message.ID})
+			_ = a.sendEnvelope(peerID, "chat-ack", ackPayload)
+		}
+	case "chat-ack":
+		var ack struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(message.Payload, &ack) == nil && ack.ID != "" {
+			a.emit("chat-ack", map[string]any{"peer_id": peerID, "id": ack.ID})
+		}
+	case "ping":
+		_ = a.sendEnvelope(peerID, "pong", message.Payload)
+	case "pong":
+		var pingData map[string]any
+		if json.Unmarshal(message.Payload, &pingData) == nil {
+			a.emit("pong", map[string]any{"peer_id": peerID, "data": pingData})
 		}
 	case "group-chat":
 		if len(message.Payload) > 64*1024 {

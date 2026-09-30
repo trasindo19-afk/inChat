@@ -20,14 +20,113 @@ const state = {
   pendingFileOffer: null,
   pendingPaste: null,
   groupUnread: 0,
-  dataChannels: new Map(),
-  dataPCs: new Map(),
-  incomingDataTransfers: new Map(),
   startedAt: 0
 };
 
 const $ = (id) => document.getElementById(id);
 const app = () => window.go?.main?.App;
+
+/* =========================================================================
+   Web Audio Synthesizer (Zero External Audio Files)
+   ========================================================================= */
+
+let audioCtx = null;
+function getAudioContext() {
+  if (!audioCtx) {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (AudioContext) audioCtx = new AudioContext();
+  }
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
+  return audioCtx;
+}
+
+function playChime() {
+  if (state.settings?.soundNotifications === false) return;
+  try {
+    const ctx = getAudioContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const osc1 = ctx.createOscillator();
+    const gain1 = ctx.createGain();
+    osc1.type = 'sine';
+    osc1.frequency.setValueAtTime(880, now);
+    gain1.gain.setValueAtTime(0.12, now);
+    gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+    osc1.connect(gain1);
+    gain1.connect(ctx.destination);
+    osc1.start(now);
+    osc1.stop(now + 0.22);
+
+    const osc2 = ctx.createOscillator();
+    const gain2 = ctx.createGain();
+    osc2.type = 'sine';
+    osc2.frequency.setValueAtTime(1320, now + 0.09);
+    gain2.gain.setValueAtTime(0.14, now + 0.09);
+    gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+    osc2.connect(gain2);
+    gain2.connect(ctx.destination);
+    osc2.start(now + 0.09);
+    osc2.stop(now + 0.35);
+  } catch (_) {}
+}
+
+function playSentTick() {
+  if (state.settings?.soundNotifications === false) return;
+  try {
+    const ctx = getAudioContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(640, now);
+    osc.frequency.exponentialRampToValueAtTime(320, now + 0.04);
+    gain.gain.setValueAtTime(0.07, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.04);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.04);
+  } catch (_) {}
+}
+
+let ringInterval = null;
+function startRingTone() {
+  if (state.settings?.soundNotifications === false || ringInterval) return;
+  const playRing = () => {
+    try {
+      const ctx = getAudioContext();
+      if (!ctx) return;
+      const now = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(440, now);
+      osc.frequency.setValueAtTime(480, now + 0.2);
+      gain.gain.setValueAtTime(0.08, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.8);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.8);
+    } catch (_) {}
+  };
+  playRing();
+  ringInterval = setInterval(playRing, 2500);
+}
+
+function stopRingTone() {
+  if (ringInterval) {
+    clearInterval(ringInterval);
+    ringInterval = null;
+  }
+}
+
+/* =========================================================================
+   Utilities & Formatters
+   ========================================================================= */
 
 function showToast(message, timeout = 3500) {
   const toast = $('toast');
@@ -55,11 +154,64 @@ function formatBytes(bytes = 0) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+const EMOJI_PALETTE = ['🚀', '🍕', '🎯', '⚡', '🛡️', '💎', '🌟', '🍀', '🔥', '🦊', '🎨', '🪐', '🎸', '🌈', '🍦', '🛸', '🦁', '⚓', '🔮', '🏆'];
+
+function fingerprintToEmojis(fingerprint = '') {
+  if (!fingerprint) return '🔒 ✨ 🛡️ 🔑';
+  let hash = 0;
+  for (let i = 0; i < fingerprint.length; i += 1) {
+    hash = ((hash << 5) - hash) + fingerprint.charCodeAt(i);
+    hash |= 0;
+  }
+  const abs = Math.abs(hash);
+  const e1 = EMOJI_PALETTE[abs % EMOJI_PALETTE.length];
+  const e2 = EMOJI_PALETTE[Math.floor(abs / 7) % EMOJI_PALETTE.length];
+  const e3 = EMOJI_PALETTE[Math.floor(abs / 31) % EMOJI_PALETTE.length];
+  const e4 = EMOJI_PALETTE[Math.floor(abs / 127) % EMOJI_PALETTE.length];
+  return `${e1} ${e2} ${e3} ${e4}`;
+}
+
+function renderFormattedText(text) {
+  if (!text) return '';
+  const codeBlocks = [];
+  let formatted = text.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    const placeholder = `__CODE_BLOCK_${codeBlocks.length}__`;
+    codeBlocks.push({ lang: lang || 'code', raw: code.trim(), code: escapeHtml(code.trim()) });
+    return placeholder;
+  });
+
+  formatted = escapeHtml(formatted);
+  formatted = formatted.replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>');
+  formatted = formatted.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  formatted = formatted.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  formatted = formatted.replace(/_([^_]+)_/g, '<em>$1</em>');
+  formatted = formatted.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+
+  for (let i = 0; i < codeBlocks.length; i += 1) {
+    const block = codeBlocks[i];
+    const blockHtml = `
+      <div class="code-block-wrapper">
+        <div class="code-header">
+          <span>${escapeHtml(block.lang)}</span>
+          <button class="code-copy-btn" data-copy-code="${encodeURIComponent(block.raw)}">Copy</button>
+        </div>
+        <pre class="code-pre"><code>${block.code}</code></pre>
+      </div>`;
+    formatted = formatted.replace(`__CODE_BLOCK_${i}__`, blockHtml);
+  }
+
+  return formatted;
+}
+
 async function callApp(method, ...args) {
   const api = app();
   if (!api?.[method]) throw new Error(`inChat backend is not ready: ${method}`);
   return api[method](...args);
 }
+
+/* =========================================================================
+   Application Initialization
+   ========================================================================= */
 
 async function init() {
   $('app-brand-icon').src = appIcon;
@@ -86,6 +238,8 @@ async function init() {
   if (window.runtime?.EventsOn) {
     window.runtime.EventsOn('peer', (peer) => updatePeer(peer));
     window.runtime.EventsOn('message', (payload) => receiveMessage(payload));
+    window.runtime.EventsOn('chat-ack', (payload) => handleChatAck(payload));
+    window.runtime.EventsOn('pong', (payload) => handlePong(payload));
     window.runtime.EventsOn('group-message', (payload) => receiveGroupMessage(payload));
     window.runtime.EventsOn('signal', (payload) => handleSignal(payload).catch((error) => showToast(error.message)));
     window.runtime.EventsOn('file', (payload) => receiveFile(payload));
@@ -172,6 +326,9 @@ function bindEvents() {
   $('group-button').addEventListener('click', startGroupCall);
   $('rdp-button').addEventListener('click', launchRDP);
   $('attach-button').addEventListener('click', pickAndSendFile);
+  $('voice-note-button').addEventListener('click', startVoiceRecording);
+  $('cancel-voice').addEventListener('click', cancelVoiceRecording);
+  $('send-voice').addEventListener('click', sendVoiceRecording);
   $('peer-info-button').addEventListener('click', showPeerInfo);
   $('diagnostics-button').addEventListener('click', showDiagnostics);
   $('close-diagnostics').addEventListener('click', () => $('diagnostics-modal').classList.add('hidden'));
@@ -195,6 +352,7 @@ function bindEvents() {
   $('image-modal').addEventListener('click', (e) => {
     if (e.target === $('image-modal')) closeImageModal();
   });
+
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       closeImageModal();
@@ -202,8 +360,115 @@ function bindEvents() {
       $('diagnostics-modal').classList.add('hidden');
       $('peer-modal').classList.add('hidden');
       cancelPendingPaste();
+      cancelVoiceRecording();
     }
   });
+}
+
+/* =========================================================================
+   Voice Memo Recorder
+   ========================================================================= */
+
+let mediaRecorder = null;
+let recordedAudioChunks = [];
+let voiceTimerInterval = null;
+let voiceStartTime = 0;
+
+async function startVoiceRecording() {
+  if (!state.selectedPeer) return showToast('Select a peer first');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recordedAudioChunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data?.size > 0) recordedAudioChunks.push(e.data);
+    };
+    mediaRecorder.start();
+    voiceStartTime = Date.now();
+    $('voice-timer').textContent = '0:00';
+    $('voice-recording-bar').classList.remove('hidden');
+    $('message-input').classList.add('hidden');
+    $('send-button').classList.add('hidden');
+
+    voiceTimerInterval = setInterval(() => {
+      const elapsedSec = Math.floor((Date.now() - voiceStartTime) / 1000);
+      const m = Math.floor(elapsedSec / 60);
+      const s = elapsedSec % 60;
+      $('voice-timer').textContent = `${m}:${s < 10 ? '0' : ''}${s}`;
+    }, 500);
+  } catch (err) {
+    showToast(`Microphone access failed: ${err.message}`);
+  }
+}
+
+function cancelVoiceRecording() {
+  if (voiceTimerInterval) clearInterval(voiceTimerInterval);
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stream.getTracks().forEach((t) => t.stop());
+    mediaRecorder.stop();
+  }
+  mediaRecorder = null;
+  recordedAudioChunks = [];
+  $('voice-recording-bar').classList.add('hidden');
+  $('message-input').classList.remove('hidden');
+  $('send-button').classList.remove('hidden');
+}
+
+async function sendVoiceRecording() {
+  if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+  clearInterval(voiceTimerInterval);
+
+  mediaRecorder.onstop = async () => {
+    const audioBlob = new Blob(recordedAudioChunks, { type: 'audio/webm' });
+    mediaRecorder.stream.getTracks().forEach((t) => t.stop());
+    mediaRecorder = null;
+
+    $('voice-recording-bar').classList.add('hidden');
+    $('message-input').classList.remove('hidden');
+    $('send-button').classList.remove('hidden');
+
+    if (audioBlob.size < 200) return; // Too short
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const dataUrl = e.target.result;
+      const base64 = dataUrl.split(',')[1];
+      const now = new Date();
+      const timeStr = `${now.getHours()}${now.getMinutes()}${now.getSeconds()}`;
+      const name = `voice-memo-${timeStr}.webm`;
+
+      if (state.selectedPeer === LAN_GROUP_ID) {
+        addMessage(LAN_GROUP_ID, {
+          kind: 'audio',
+          name,
+          url: dataUrl,
+          size: audioBlob.size,
+          mine: true,
+          senderName: state.identity?.name,
+          time: formatTime()
+        });
+        await callApp('BroadcastMessage', `[Voice memo sent: ${name}]`);
+        return;
+      }
+
+      try {
+        await callApp('SendFileDirect', state.selectedPeer, name, 'audio/webm', base64);
+        addMessage(state.selectedPeer, {
+          kind: 'audio',
+          name,
+          url: dataUrl,
+          size: audioBlob.size,
+          mine: true,
+          time: formatTime()
+        });
+        playSentTick();
+      } catch (err) {
+        showToast(`Could not send voice memo: ${err.message}`);
+      }
+    };
+    reader.readAsDataURL(audioBlob);
+  };
+  mediaRecorder.stop();
 }
 
 /* =========================================================================
@@ -302,7 +567,6 @@ async function sendPendingPaste() {
   if (!base64Data) return;
 
   if (state.selectedPeer === LAN_GROUP_ID) {
-    // Group image message
     addMessage(LAN_GROUP_ID, {
       kind: 'image',
       name: item.name,
@@ -313,12 +577,11 @@ async function sendPendingPaste() {
       senderName: state.identity?.name,
       time: formatTime()
     });
-    // Send notification caption to LAN
-    await callApp('BroadcastMessage', caption ? `[Shared image: ${item.name}] ${caption}` : `[Shared image: ${item.name}]`);
+    playSentTick();
+    await callApp('BroadcastMessage', caption ? `[Shared photo: ${item.name}] ${caption}` : `[Shared photo: ${item.name}]`);
     return;
   }
 
-  // 1-on-1 direct image send
   try {
     await callApp('SendFileDirect', state.selectedPeer, item.name, item.mime, base64Data);
     addMessage(state.selectedPeer, {
@@ -330,12 +593,13 @@ async function sendPendingPaste() {
       mine: true,
       time: formatTime()
     });
+    playSentTick();
     if (caption) {
       await callApp('SendMessage', state.selectedPeer, caption);
-      addMessage(state.selectedPeer, { kind: 'text', text: caption, mine: true, time: formatTime() });
+      addMessage(state.selectedPeer, { kind: 'text', text: caption, mine: true, status: 'sent', time: formatTime() });
     }
   } catch (error) {
-    showToast(`Could not send image: ${error.message}`);
+    showToast(`Could not send photo: ${error.message}`);
   }
 }
 
@@ -344,7 +608,6 @@ async function sendDirectOrDataFile(file) {
     return showToast('File transfers are 1-on-1 direct. Select a peer to send files.');
   }
 
-  // Try WebRTC DataChannel if connected, or direct Base64 if under 15MB
   if (file.size <= 15 * 1024 * 1024) {
     const reader = new FileReader();
     reader.onload = async (e) => {
@@ -360,6 +623,7 @@ async function sendDirectOrDataFile(file) {
           mine: true,
           time: formatTime()
         });
+        playSentTick();
         showToast(`Sent ${file.name}`);
       } catch (err) {
         showToast(err.message);
@@ -367,14 +631,15 @@ async function sendDirectOrDataFile(file) {
     };
     reader.readAsDataURL(file);
   } else {
-    // For large files (>15MB), send via WebRTC DataChannel if available or PickAndSendFile
     showToast(`Large file (${formatBytes(file.size)}): use Attach button or direct LAN file selector`);
   }
 }
 
 /* =========================================================================
-   LAN Group Room & Peer Navigation
+   LAN Group Room, Peer Navigation & Ping
    ========================================================================= */
+
+let pingInterval = null;
 
 function selectLanGroupRoom() {
   state.selectedPeer = LAN_GROUP_ID;
@@ -385,6 +650,7 @@ function selectLanGroupRoom() {
 
   updateConversationHeader();
   renderMessages();
+  startPingTimer(null);
 }
 
 function updateConversationHeader() {
@@ -400,6 +666,7 @@ function updateConversationHeader() {
     $('conversation-name').textContent = 'LAN Group Room';
     $('conversation-state').textContent = `${onlineCount} peer(s) online · Broadcast mesh`;
     $('conversation-state').classList.remove('state-failed');
+    $('conversation-ping').classList.add('hidden');
     $('voice-button').classList.add('hidden');
     $('video-button').classList.add('hidden');
     $('rdp-button').classList.add('hidden');
@@ -419,6 +686,35 @@ function updateConversationHeader() {
   $('conversation-state').textContent = peer.connected ? 'online · direct connection' : stateLine;
   $('conversation-state').classList.toggle('state-failed', peer.status === 'failed');
   $('conversation-state').title = peer.lastError || '';
+
+  if (peer.connected) {
+    startPingTimer(peer.id);
+  } else {
+    $('conversation-ping').classList.add('hidden');
+  }
+}
+
+function startPingTimer(peerId) {
+  if (pingInterval) clearInterval(pingInterval);
+  if (!peerId || peerId === LAN_GROUP_ID) {
+    $('conversation-ping').classList.add('hidden');
+    return;
+  }
+  const sendPing = () => {
+    if (state.selectedPeer !== peerId) return;
+    callApp('PingPeer', peerId, Date.now()).catch(() => {});
+  };
+  sendPing();
+  pingInterval = setInterval(sendPing, 4000);
+}
+
+function handlePong(payload) {
+  if (state.selectedPeer === payload.peer_id && payload.data?.ts) {
+    const rtt = Math.max(1, Date.now() - payload.data.ts);
+    const badge = $('conversation-ping');
+    badge.textContent = `⚡ ${rtt} ms`;
+    badge.classList.remove('hidden');
+  }
 }
 
 async function refreshPeers() {
@@ -468,7 +764,7 @@ function renderPeers() {
   $('lan-room-status').textContent = `Local broadcast · ${onlineCount} online`;
 
   if (!peers.length) {
-    list.innerHTML = '<div class="empty-state">Looking for peers on your LAN…<br>Make sure both devices are connected to the same network.</div>';
+    list.innerHTML = '<div class="empty-state">Looking for peers on your LAN…<br>Make sure both devices are on the same network.</div>';
     return;
   }
   list.innerHTML = peers.map((peer) => `
@@ -500,12 +796,13 @@ function renderMessages() {
   const messages = state.messages.get(state.selectedPeer) || [];
   if (!messages.length) {
     const isGroup = state.selectedPeer === LAN_GROUP_ID;
-    list.innerHTML = `<div class="empty-state">${isGroup ? 'Welcome to the LAN Group Room.<br>Broadcast a message to everyone on your local network.' : 'This conversation is private and direct.<br>Say hello to start.'}</div>`;
+    list.innerHTML = `<div class="empty-state">${isGroup ? 'Welcome to the LAN Group Room.<br>Broadcast messages to everyone on your local network.' : 'This conversation is private and direct.<br>Say hello to start.'}</div>`;
     return;
   }
   list.innerHTML = messages.map((m) => {
     if (m.kind === 'file') return renderFileMessage(m);
     if (m.kind === 'image') return renderImageMessage(m);
+    if (m.kind === 'audio') return renderAudioMessage(m);
     return renderTextMessage(m);
   }).join('');
 
@@ -517,17 +814,66 @@ function renderMessages() {
     img.addEventListener('click', () => openImageModal(img.src, img.alt));
   });
 
+  list.querySelectorAll('[data-copy-code]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const code = decodeURIComponent(btn.dataset.copyCode || '');
+      copyText(code);
+      btn.textContent = 'Copied!';
+      setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+    });
+  });
+
+  list.querySelectorAll('[data-voice-audio]').forEach((audio) => {
+    const id = audio.dataset.voiceAudio;
+    const btn = list.querySelector(`[data-voice-btn="${id}"]`);
+    const progress = list.querySelector(`[data-voice-prog="${id}"]`);
+    const durLabel = list.querySelector(`[data-voice-dur="${id}"]`);
+
+    audio.onloadedmetadata = () => {
+      const dur = Math.round(audio.duration || 0);
+      if (durLabel) durLabel.textContent = `0:${dur < 10 ? '0' : ''}${dur}`;
+    };
+
+    audio.ontimeupdate = () => {
+      if (audio.duration && progress) {
+        const pct = (audio.currentTime / audio.duration) * 100;
+        progress.style.width = `${pct}%`;
+      }
+    };
+
+    audio.onended = () => {
+      if (btn) btn.textContent = '▶';
+      if (progress) progress.style.width = '0%';
+    };
+
+    if (btn) {
+      btn.onclick = () => {
+        if (audio.paused) {
+          document.querySelectorAll('audio').forEach((a) => { if (a !== audio) a.pause(); });
+          audio.play().catch(() => {});
+          btn.textContent = '⏸';
+        } else {
+          audio.pause();
+          btn.textContent = '▶';
+        }
+      };
+    }
+  });
+
   list.scrollTop = list.scrollHeight;
 }
 
 function renderTextMessage(message) {
   const senderTag = message.senderName && !message.mine ? `<span class="message-sender">${escapeHtml(message.senderName)}</span>` : '';
-  return `<div class="message ${message.mine ? 'mine' : ''}">${senderTag}<div class="message-bubble">${escapeHtml(message.text)}</div><small class="message-time">${message.time}</small></div>`;
+  const statusCheck = message.mine ? (message.status === 'delivered' ? '<span class="delivery-status delivered">✓✓</span>' : '<span class="delivery-status">✓</span>') : '';
+  return `<div class="message ${message.mine ? 'mine' : ''}">${senderTag}<div class="message-bubble">${renderFormattedText(message.text)}</div><small class="message-time">${message.time}${statusCheck}</small></div>`;
 }
 
 function renderImageMessage(message) {
   const senderTag = message.senderName && !message.mine ? `<span class="message-sender">${escapeHtml(message.senderName)}</span>` : '';
-  const captionHtml = message.caption ? `<div style="margin-top:4px;font-size:13px">${escapeHtml(message.caption)}</div>` : '';
+  const captionHtml = message.caption ? `<div style="margin-top:4px;font-size:13px">${renderFormattedText(message.caption)}</div>` : '';
+  const statusCheck = message.mine ? (message.status === 'delivered' ? '<span class="delivery-status delivered">✓✓</span>' : '<span class="delivery-status">✓</span>') : '';
   return `
     <div class="message ${message.mine ? 'mine' : ''}">
       ${senderTag}
@@ -537,7 +883,28 @@ function renderImageMessage(message) {
         </div>
         ${captionHtml}
       </div>
-      <small class="message-time">${message.time}</small>
+      <small class="message-time">${message.time}${statusCheck}</small>
+    </div>`;
+}
+
+function renderAudioMessage(message) {
+  const audioId = `audio-${message.time.replace(/[^0-9]/g, '')}-${Math.random().toString(16).slice(2, 6)}`;
+  const senderTag = message.senderName && !message.mine ? `<span class="message-sender">${escapeHtml(message.senderName)}</span>` : '';
+  const statusCheck = message.mine ? (message.status === 'delivered' ? '<span class="delivery-status delivered">✓✓</span>' : '<span class="delivery-status">✓</span>') : '';
+  return `
+    <div class="message ${message.mine ? 'mine' : ''}">
+      ${senderTag}
+      <div class="message-bubble" style="padding:6px 10px">
+        <div class="voice-note-bubble">
+          <button class="voice-play-btn" data-voice-btn="${audioId}">▶</button>
+          <div class="voice-track">
+            <div class="voice-progress" data-voice-prog="${audioId}"></div>
+          </div>
+          <span class="voice-duration" data-voice-dur="${audioId}">Voice memo</span>
+          <audio src="${message.url}" data-voice-audio="${audioId}" preload="metadata"></audio>
+        </div>
+      </div>
+      <small class="message-time">${message.time}${statusCheck}</small>
     </div>`;
 }
 
@@ -582,7 +949,6 @@ function toggleImageFullscreen() {
   }
 }
 
-
 async function sendCurrentMessage() {
   if (state.pendingPaste) {
     return sendPendingPaste();
@@ -592,16 +958,20 @@ async function sendCurrentMessage() {
   const text = input.value.trim();
   if (!text || !state.selectedPeer) return;
 
+  const msgId = `m-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+
   if (state.selectedPeer === LAN_GROUP_ID) {
     try {
       await callApp('BroadcastMessage', text);
       addMessage(LAN_GROUP_ID, {
+        id: msgId,
         kind: 'text',
         text,
         mine: true,
         senderName: state.identity?.name,
         time: formatTime()
       });
+      playSentTick();
       input.value = '';
     } catch (error) {
       showToast(error.message);
@@ -611,10 +981,23 @@ async function sendCurrentMessage() {
 
   try {
     await callApp('SendMessage', state.selectedPeer, text);
-    addMessage(state.selectedPeer, { kind: 'text', text, mine: true, time: formatTime() });
+    addMessage(state.selectedPeer, { id: msgId, kind: 'text', text, mine: true, status: 'sent', time: formatTime() });
+    playSentTick();
     input.value = '';
   } catch (error) {
     showToast(error.message);
+  }
+}
+
+function handleChatAck(payload) {
+  const messages = state.messages.get(payload.peer_id);
+  if (messages) {
+    const msg = messages.find((m) => m.id === payload.id);
+    if (msg) {
+      msg.status = 'delivered';
+      saveMessageHistory();
+      if (state.selectedPeer === payload.peer_id) renderMessages();
+    }
   }
 }
 
@@ -625,12 +1008,10 @@ async function sendCurrentMessage() {
 async function loadMessageHistory() {
   try {
     let saved = null;
-    // 1. Try disk storage from Go backend
     if (app()?.LoadChatHistory) {
       const diskJson = await callApp('LoadChatHistory');
       if (diskJson) saved = JSON.parse(diskJson);
     }
-    // 2. Fallback to localStorage
     if (!saved) {
       const raw = window.localStorage.getItem('inchat.messages.v1');
       if (raw) saved = JSON.parse(raw);
@@ -667,18 +1048,21 @@ function addMessage(peerId, message) {
 }
 
 function receiveMessage(payload) {
-  addMessage(payload.peer_id, { kind: 'text', text: payload.text, mine: false, time: formatTime() });
+  addMessage(payload.peer_id, { id: payload.id, kind: 'text', text: payload.text, mine: false, time: formatTime() });
+  playChime();
   showToast(`New message from ${state.peers.get(payload.peer_id)?.name || 'peer'}`);
 }
 
 function receiveGroupMessage(payload) {
   addMessage(LAN_GROUP_ID, {
+    id: payload.id,
     kind: 'text',
     text: payload.text,
     mine: false,
     senderName: payload.name,
     time: formatTime()
   });
+  playChime();
   if (state.selectedPeer !== LAN_GROUP_ID) {
     state.groupUnread += 1;
     $('lan-room-badge').textContent = state.groupUnread;
@@ -690,13 +1074,29 @@ function receiveGroupMessage(payload) {
 function receiveFile(payload) {
   try {
     const isImage = (payload.mime && payload.mime.startsWith('image/')) || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(payload.name);
+    const isAudio = payload.mime?.startsWith('audio/') || /\.(webm|ogg|mp3|wav)$/i.test(payload.name);
     let url = '';
     if (payload.data) {
       const binary = atob(payload.data || '');
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-      const blob = new Blob([bytes], { type: payload.mime || 'image/png' });
+      const mime = payload.mime || (isAudio ? 'audio/webm' : isImage ? 'image/png' : 'application/octet-stream');
+      const blob = new Blob([bytes], { type: mime });
       url = URL.createObjectURL(blob);
+    }
+
+    if (isAudio && url) {
+      addMessage(payload.peer_id, {
+        kind: 'audio',
+        name: payload.name,
+        size: payload.size,
+        url,
+        mine: false,
+        time: formatTime()
+      });
+      playChime();
+      showToast(`Received voice memo`);
+      return;
     }
 
     if (isImage && url) {
@@ -709,6 +1109,7 @@ function receiveFile(payload) {
         mine: false,
         time: formatTime()
       });
+      playChime();
       showToast(payload.saved_path ? `Saved photo ${payload.name}` : `Received photo ${payload.name}`);
       return;
     }
@@ -722,6 +1123,7 @@ function receiveFile(payload) {
         mine: false,
         time: formatTime()
       });
+      playChime();
       showToast(`Saved ${payload.name}`);
       return;
     }
@@ -735,6 +1137,7 @@ function receiveFile(payload) {
         mine: false,
         time: formatTime()
       });
+      playChime();
       showToast(`Received ${payload.name}`);
     }
   } catch (error) {
@@ -789,6 +1192,7 @@ function completeFileTransfer(payload) {
   } else if (payload.saved_path) {
     addMessage(payload.peer_id, { kind: 'file', name: payload.name, size: payload.size, savedPath: payload.saved_path, mine: false, time: formatTime() });
   }
+  playChime();
   showToast(payload.saved_path ? `Saved ${payload.name}` : `Sent ${payload.name}`);
 }
 
@@ -860,7 +1264,7 @@ function applyTheme(theme) {
   document.body.dataset.theme = light ? 'light' : 'dark';
 }
 
-function applySettingsToUI() {
+async function applySettingsToUI() {
   if (!state.settings) return;
   $('settings-display-name').value = state.settings.displayName || '';
   $('settings-receive-folder').value = state.settings.receiveFolder || '';
@@ -868,6 +1272,13 @@ function applySettingsToUI() {
   $('settings-theme').value = state.settings.theme || 'dark';
   applyTheme(state.settings.theme || 'dark');
   $('auto-accept-files').checked = Boolean(state.settings.autoAcceptFiles);
+  $('sound-notifications').checked = state.settings.soundNotifications !== false;
+
+  try {
+    const autoStart = await callApp('GetAutoStart');
+    $('auto-start-boot').checked = Boolean(autoStart);
+  } catch (_) {}
+
   applyAvatar($('local-avatar'), state.settings.avatarData);
   applyAvatar($('settings-avatar-preview'), state.settings.avatarData);
 }
@@ -875,7 +1286,7 @@ function applySettingsToUI() {
 async function showSettings() {
   try {
     state.settings = await callApp('GetSettings');
-    applySettingsToUI();
+    await applySettingsToUI();
     $('settings-modal').classList.remove('hidden');
   } catch (error) {
     showToast(error.message);
@@ -885,7 +1296,7 @@ async function showSettings() {
 async function chooseAvatar() {
   try {
     state.settings = await callApp('ChooseAvatar');
-    applySettingsToUI();
+    await applySettingsToUI();
     showToast('Profile photo updated');
   } catch (error) {
     if (error) showToast(error.message);
@@ -924,15 +1335,22 @@ async function saveSettings() {
   try {
     const displayName = $('settings-display-name').value.trim();
     const autoAccept = $('auto-accept-files').checked;
+    const soundEnabled = $('sound-notifications').checked;
+    const autoStart = $('auto-start-boot').checked;
     const updateFeed = $('settings-update-feed').value.trim();
     const theme = $('settings-theme').value;
+
     await callApp('SetDisplayName', displayName);
     await callApp('SetAutoAcceptFiles', autoAccept);
     await callApp('SetUpdateFeedURL', updateFeed);
     await callApp('SetTheme', theme);
+
+    try { await callApp('SetAutoStart', autoStart); } catch (_) {}
+
     state.identity.name = displayName;
     state.settings = await callApp('GetSettings');
-    applySettingsToUI();
+    state.settings.soundNotifications = soundEnabled;
+    await applySettingsToUI();
     $('settings-modal').classList.add('hidden');
     showToast('Settings saved');
   } catch (error) {
@@ -1056,7 +1474,12 @@ async function acceptGroupInvite(payload) {
   if (state.pc || state.group) return;
   const participants = [...new Set(data.participants || [])];
   if (!participants.includes(payload.peer_id) || !participants.includes(state.identity.id)) return showToast('Invalid group call invitation');
-  if (!window.confirm(`Accept group call from ${state.peers.get(payload.peer_id)?.name || 'peer'}?`)) return;
+
+  startRingTone();
+  const accept = window.confirm(`Accept group call from ${state.peers.get(payload.peer_id)?.name || 'peer'}?`);
+  stopRingTone();
+  if (!accept) return;
+
   try {
     state.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: { ideal: 1280 }, height: { ideal: 720 } } });
     state.cameraTrack = state.localStream.getVideoTracks()[0] || null;
@@ -1149,7 +1572,9 @@ async function handleSignal(payload) {
   if (payload.kind.startsWith('group-')) return handleGroupSignal(payload);
   if (state.activeCallPeer && state.activeCallPeer !== payload.peer_id) return;
   if (payload.kind === 'offer') {
+    startRingTone();
     const accept = window.confirm(`Accept ${peer.name || 'peer'} incoming call?`);
+    stopRingTone();
     if (!accept) {
       callApp('SendSignal', payload.peer_id, 'hangup', JSON.stringify({ reason: 'declined' })).catch(() => {});
       return;
@@ -1167,6 +1592,7 @@ async function handleSignal(payload) {
   } else if (payload.kind === 'candidate' && state.pc) {
     await state.pc.addIceCandidate(JSON.parse(payload.data));
   } else if (payload.kind === 'hangup') {
+    stopRingTone();
     await endCall();
     showToast(`${peer.name || 'Peer'} ended the call`);
   }
@@ -1232,6 +1658,7 @@ async function toggleScreenShare() {
 }
 
 async function endCall(closePanel = true) {
+  stopRingTone();
   if (state.group) {
     const group = state.group;
     for (const peerId of group.participants) {
@@ -1279,7 +1706,8 @@ async function showDiagnostics() {
 function showPeerInfo() {
   const peer = state.peers.get(state.selectedPeer);
   if (!peer) return;
-  $('peer-info-text').textContent = `Compare this safety code with ${peer.name || 'the other device'} before trusting the connection:\n\n${peer.fingerprint || 'Not available yet'}`;
+  $('peer-emoji-display').textContent = fingerprintToEmojis(peer.fingerprint);
+  $('peer-info-text').textContent = `Visual emoji code & SHA-256 fingerprint for ${peer.name || 'peer'}:\n\n${peer.fingerprint || 'Not available yet'}`;
   $('peer-modal').classList.remove('hidden');
 }
 

@@ -65,7 +65,7 @@
 
           <div id="conversation" class="conversation-content hidden">
             <div class="conversation-header">
-              <div><h2 id="conversation-name">Peer</h2><small id="conversation-state">offline</small></div>
+              <div><h2 id="conversation-name">Peer</h2><div class="header-meta"><small id="conversation-state">offline</small><span id="conversation-ping" class="ping-pill hidden">⚡ 1ms</span></div></div>
               <div class="call-actions"><button id="voice-button" class="call-button" title="Voice call">☎</button><button id="video-button" class="call-button" title="Video call">▣</button><button id="group-button" class="call-button" title="Group call">G</button><button id="rdp-button" class="call-button" title="Open Windows RDP">RDP</button><button id="peer-info-button" class="icon-button" title="Peer safety code">ⓘ</button></div>
             </div>
             <div id="message-list" class="message-list"></div>
@@ -82,7 +82,17 @@
               </div>
             </div>
 
-            <div class="composer"><button id="attach-button" class="icon-button" title="Attach file">＋</button><input id="message-input" type="text" placeholder="Write a private message…" autocomplete="off" /><button id="send-button" class="send-button">Send</button></div>
+            <div id="voice-recording-bar" class="voice-recording-bar hidden">
+              <span class="recording-indicator">●</span>
+              <span id="voice-timer">0:00</span>
+              <span class="recording-hint">Recording voice memo…</span>
+              <div class="voice-actions">
+                <button id="cancel-voice" class="icon-button" title="Cancel">✕</button>
+                <button id="send-voice" class="send-button mini-send" title="Send Voice Memo">Send</button>
+              </div>
+            </div>
+
+            <div class="composer"><button id="attach-button" class="icon-button" title="Attach file">＋</button><button id="voice-note-button" class="icon-button" title="Record voice note">🎙</button><input id="message-input" type="text" placeholder="Write a message… (Markdown & Code supported)" autocomplete="off" /><button id="send-button" class="send-button">Send</button></div>
           </div>
         </section>
 
@@ -94,10 +104,10 @@
       </main>
 
       <div id="toast" class="toast hidden"></div>
-      <div id="settings-modal" class="modal hidden"><div class="modal-card settings-card"><div class="modal-header"><h2>Settings</h2><button id="close-settings" class="icon-button">×</button></div><div class="settings-form"><div class="settings-profile"><div id="settings-avatar-preview" class="avatar avatar-large"><span id="settings-avatar-fallback">I</span><img id="settings-avatar-image" class="avatar-image" alt="" hidden /></div><div><button id="choose-avatar" class="secondary-button">Change photo</button><p class="settings-hint">PNG, JPG, WEBP, or GIF. Max 5 MB.</p></div></div><label>Display name<input id="settings-display-name" type="text" maxlength="64" /></label><label>Received files folder<div class="folder-row"><input id="settings-receive-folder" type="text" readonly /><button id="choose-folder" class="secondary-button">Choose</button></div></label><label class="checkbox-row"><input id="auto-accept-files" type="checkbox" /><span>Automatically save incoming files</span></label><label>Theme<select id="settings-theme"><option value="dark">Dark</option><option value="light">Light</option><option value="system">Follow system</option></select></label><label>Update feed URL<input id="settings-update-feed" type="text" placeholder="https://api.github.com/repos/OWNER/inChat/releases/latest" /></label><div class="update-actions"><button id="check-update" class="secondary-button">Check for updates</button><span id="update-status" class="settings-hint"></span></div><button id="save-settings" class="send-button settings-save">Save settings</button></div></div></div>
+      <div id="settings-modal" class="modal hidden"><div class="modal-card settings-card"><div class="modal-header"><h2>Settings</h2><button id="close-settings" class="icon-button">×</button></div><div class="settings-form"><div class="settings-profile"><div id="settings-avatar-preview" class="avatar avatar-large"><span id="settings-avatar-fallback">I</span><img id="settings-avatar-image" class="avatar-image" alt="" hidden /></div><div><button id="choose-avatar" class="secondary-button">Change photo</button><p class="settings-hint">PNG, JPG, WEBP, or GIF. Max 5 MB.</p></div></div><label>Display name<input id="settings-display-name" type="text" maxlength="64" /></label><label>Received files folder<div class="folder-row"><input id="settings-receive-folder" type="text" readonly /><button id="choose-folder" class="secondary-button">Choose</button></div></label><label class="checkbox-row"><input id="auto-accept-files" type="checkbox" /><span>Automatically save incoming files</span></label><label class="checkbox-row"><input id="sound-notifications" type="checkbox" checked /><span>Play sound effects (chimes, ringtone, message sent)</span></label><label class="checkbox-row"><input id="auto-start-boot" type="checkbox" /><span>Start inChat automatically when Windows boots</span></label><label>Theme<select id="settings-theme"><option value="dark">Dark</option><option value="light">Light</option><option value="system">Follow system</option></select></label><label>Update feed URL<input id="settings-update-feed" type="text" placeholder="https://api.github.com/repos/OWNER/inChat/releases/latest" /></label><div class="update-actions"><button id="check-update" class="secondary-button">Check for updates</button><span id="update-status" class="settings-hint"></span></div><button id="save-settings" class="send-button settings-save">Save settings</button></div></div></div>
       <div id="diagnostics-modal" class="modal hidden"><div class="modal-card"><div class="modal-header"><h2>Diagnostics</h2><button id="close-diagnostics" class="icon-button">×</button></div><pre id="diagnostics-content"></pre><button id="copy-diagnostics" class="send-button">Copy diagnostics</button></div></div>
       <div id="file-offer-modal" class="modal hidden"><div class="modal-card file-offer-card"><div class="modal-header"><h2>Incoming file</h2></div><div class="file-offer-icon">▧</div><p id="file-offer-text"></p><div class="modal-actions"><button id="reject-file" class="secondary-button">Reject</button><button id="accept-file" class="send-button">Accept</button></div></div></div>
-      <div id="peer-modal" class="modal hidden"><div class="modal-card"><div class="modal-header"><h2>Peer safety code</h2><button id="close-peer-info" class="icon-button">×</button></div><p id="peer-info-text"></p><button id="copy-peer-info" class="send-button">Copy safety code</button></div></div>
+      <div id="peer-modal" class="modal hidden"><div class="modal-card"><div class="modal-header"><h2>Peer safety code</h2><button id="close-peer-info" class="icon-button">×</button></div><div id="peer-emoji-card" class="peer-emoji-card"><span class="emoji-label">Visual Verification Code</span><div id="peer-emoji-display" class="peer-emoji-display">🚀 🍕 🎯 ⚡</div></div><p id="peer-info-text"></p><button id="copy-peer-info" class="send-button">Copy safety code</button></div></div>
       <div id="image-modal" class="modal hidden"><div class="modal-card image-card"><div class="modal-header"><h2 id="image-modal-title">Image preview</h2><div class="modal-header-actions"><button id="image-modal-fullscreen" class="icon-button" title="Toggle Fullscreen">⛶</button><button id="close-image-modal" class="icon-button" title="Close">✕</button></div></div><div class="image-modal-stage"><img id="image-modal-img" alt="" /></div><div class="modal-actions"><span id="image-modal-meta" class="settings-hint" style="margin-right:auto;align-self:center"></span><a id="image-modal-download" class="secondary-button" download="image.png">Save image</a></div></div></div>
     </div>
     <script type="module" src="/src/main.js"></script>

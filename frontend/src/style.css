@@ -144,6 +144,49 @@ button { cursor: pointer; }
 .paste-actions { display: flex; align-items: center; gap: 8px; }
 .mini-send { padding: 6px 12px !important; font-size: 11px !important; }
 
+/* Voice Recording Bar */
+.voice-recording-bar { display: flex; align-items: center; gap: 12px; padding: 8px 18px; background: rgba(239, 68, 68, 0.12); border-top: 1px solid rgba(239, 68, 68, 0.3); border-bottom: 1px solid rgba(239, 68, 68, 0.3); }
+.recording-indicator { color: #ef4444; font-size: 14px; animation: pulseRed 1s infinite; }
+@keyframes pulseRed { 0% { opacity: 1; transform: scale(1); } 50% { opacity: 0.3; transform: scale(0.85); } 100% { opacity: 1; transform: scale(1); } }
+#voice-timer { font-family: monospace; font-size: 13px; font-weight: 700; color: #fca5a5; }
+.recording-hint { color: #f87171; font-size: 12px; }
+.voice-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+
+/* Voice Memo Bubble in Chat */
+.voice-note-bubble { display: flex; align-items: center; gap: 10px; padding: 4px 2px; min-width: 190px; }
+.voice-play-btn { width: 32px; height: 32px; border-radius: 50%; border: 0; background: #3b82f6; color: #fff; font-size: 12px; display: grid; place-items: center; cursor: pointer; flex-shrink: 0; }
+.message.mine .voice-play-btn { background: #ffffff; color: #2563eb; }
+.voice-track { flex: 1; height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.2); position: relative; }
+.voice-progress { height: 100%; border-radius: 2px; background: #3b82f6; width: 0%; }
+.message.mine .voice-progress { background: #ffffff; }
+.voice-duration { font-size: 10px; font-family: monospace; color: #94a3b8; }
+.message.mine .voice-duration { color: #e0e7ff; }
+
+/* Code Snippets & Markdown */
+.inline-code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; background: rgba(0, 0, 0, 0.3); padding: 2px 5px; border-radius: 4px; font-size: 12px; color: #93c5fd; }
+.message.mine .inline-code { background: rgba(0, 0, 0, 0.25); color: #ffffff; }
+.code-block-wrapper { margin: 6px 0; border-radius: 8px; background: #080d16; border: 1px solid #1e293b; overflow: hidden; font-family: ui-monospace, monospace; }
+.code-header { display: flex; align-items: center; justify-content: space-between; padding: 4px 10px; background: #0f172a; border-bottom: 1px solid #1e293b; font-size: 10px; color: #94a3b8; text-transform: uppercase; }
+.code-copy-btn { border: 0; background: transparent; color: #60a5fa; cursor: pointer; font-size: 10px; padding: 2px 6px; border-radius: 4px; }
+.code-copy-btn:hover { background: rgba(96, 165, 250, 0.15); }
+.code-pre { margin: 0; padding: 10px; font-size: 12px; line-height: 1.45; overflow-x: auto; color: #e2e8f0; white-space: pre; }
+.message-bubble a { color: #60a5fa; text-decoration: underline; }
+.message.mine .message-bubble a { color: #ffffff; text-decoration: underline; }
+
+/* Delivery Status Checkmarks */
+.delivery-status { margin-left: 4px; font-size: 11px; color: #64748b; font-weight: 700; letter-spacing: -1px; }
+.delivery-status.delivered { color: #38bdf8; }
+
+/* Header Meta & Ping Pill */
+.header-meta { display: flex; align-items: center; gap: 8px; }
+.ping-pill { padding: 1px 6px; border-radius: 99px; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); color: #34d399; font-size: 9px; font-weight: 700; font-family: monospace; }
+
+/* Visual Verification Emoji Card */
+.peer-emoji-card { margin: 12px 0; padding: 14px; border-radius: 12px; background: #162032; border: 1px solid #1e293b; text-align: center; }
+.emoji-label { font-size: 11px; color: #94a3b8; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+.peer-emoji-display { font-size: 32px; letter-spacing: 8px; margin-top: 8px; filter: drop-shadow(0 2px 8px rgba(0,0,0,0.4)); }
+
+
 /* Composer */
 .composer { display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-top: 1px solid #1e293b; background: #0f172a; }
 .composer input { min-width: 0; flex: 1; padding: 10px 14px; border: 1px solid #1e293b; border-radius: 10px; outline: none; color: #f1f5f9; background: #090e17; font-size: 13px; transition: border-color 0.15s ease; }
