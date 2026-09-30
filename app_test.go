@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -47,3 +48,52 @@ func TestIsAllowedLANAddress(t *testing.T) {
 		}
 	}
 }
+
+func TestEncodePowerShellCommand(t *testing.T) {
+	cmd := "Write-Output 'OK'"
+	encoded := encodePowerShellCommand(cmd)
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("base64 decode: %v", err)
+	}
+	if len(raw) != len(cmd)*2 {
+		t.Fatalf("expected UTF-16LE byte count %d, got %d", len(cmd)*2, len(raw))
+	}
+	// Verify little-endian ASCII: every odd byte is 0 for standard ASCII chars
+	for i := 0; i < len(cmd); i++ {
+		if raw[i*2] != cmd[i] || raw[i*2+1] != 0 {
+			t.Fatalf("character %d mismatch: got (%d, %d), expected (%d, 0)", i, raw[i*2], raw[i*2+1], cmd[i])
+		}
+	}
+}
+
+func TestIdentityPersistenceRoundTrip(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("APPDATA", tempDir)
+
+	orig, err := createIdentity("test-host")
+	if err != nil {
+		t.Fatalf("create identity: %v", err)
+	}
+	if err := saveIdentity(orig); err != nil {
+		t.Fatalf("save identity: %v", err)
+	}
+
+	loaded, err := loadOrCreateIdentity("test-host")
+	if err != nil {
+		t.Fatalf("load identity: %v", err)
+	}
+	if loaded.ID != orig.ID {
+		t.Fatalf("expected ID %s, got %s", orig.ID, loaded.ID)
+	}
+	if loaded.Fingerprint != orig.Fingerprint {
+		t.Fatalf("expected fingerprint %s, got %s", orig.Fingerprint, loaded.Fingerprint)
+	}
+	if len(loaded.Certificate.Certificate) == 0 {
+		t.Fatal("loaded certificate is missing")
+	}
+	if loaded.PrivateKey == nil {
+		t.Fatal("loaded private key is missing")
+	}
+}
+

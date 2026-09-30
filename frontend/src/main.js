@@ -559,22 +559,25 @@ async function startGroupCall() {
     .filter((peer) => peer.connected && peer.id !== state.selectedPeer)
     .slice(0, 3);
   if (!others.length) return showToast('At least two connected peers are needed for a group call');
-  const participants = [state.selectedPeer, ...others.map((peer) => peer.id)];
-  const names = participants.map((id) => state.peers.get(id)?.name || 'Unknown device').join(', ');
+  const participants = [state.identity?.id, state.selectedPeer, ...others.map((peer) => peer.id)].filter(Boolean);
+  const names = participants
+    .filter((id) => id !== state.identity?.id)
+    .map((id) => state.peers.get(id)?.name || 'Unknown device')
+    .join(', ');
   if (!window.confirm(`Start group call with ${names}?`)) return;
   try {
     state.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: { ideal: 1280 }, height: { ideal: 720 } } });
     state.cameraTrack = state.localStream.getVideoTracks()[0] || null;
     $('local-video').srcObject = state.localStream;
-    state.group = { id: `g-${Date.now()}-${Math.random().toString(16).slice(2)}`, host: state.selectedPeer, participants, pcs: new Map() };
+    state.group = { id: `g-${Date.now()}-${Math.random().toString(16).slice(2)}`, host: state.identity?.id, participants, pcs: new Map() };
     openGroupCallPanel();
     for (const participant of participants) {
-      if (participant === state.selectedPeer) continue;
+      if (participant === state.identity?.id) continue;
       await createGroupPeerConnection(participant);
     }
-    const invite = JSON.stringify({ call_id: state.group.id, participants });
+    const invite = JSON.stringify({ call_id: state.group.id, host: state.identity?.id, participants });
     for (const participant of participants) {
-      if (participant !== state.selectedPeer) await callApp('SendSignal', participant, 'group-invite', invite);
+      if (participant !== state.identity?.id) await callApp('SendSignal', participant, 'group-invite', invite);
     }
     await createGroupOffers();
   } catch (error) {
@@ -744,7 +747,10 @@ async function handleSignal(payload) {
   if (state.activeCallPeer && state.activeCallPeer !== payload.peer_id) return;
   if (payload.kind === 'offer') {
     const accept = window.confirm(`Accept ${peer.name || 'peer'} incoming call?`);
-    if (!accept) return;
+    if (!accept) {
+      callApp('SendSignal', payload.peer_id, 'hangup', JSON.stringify({ reason: 'declined' })).catch(() => {});
+      return;
+    }
     const offer = JSON.parse(payload.data);
     const withVideo = Boolean(offer.sdp?.includes('m=video'));
     await ensureCall(payload.peer_id, withVideo);
@@ -757,6 +763,9 @@ async function handleSignal(payload) {
     await state.pc.setRemoteDescription(JSON.parse(payload.data));
   } else if (payload.kind === 'candidate' && state.pc) {
     await state.pc.addIceCandidate(JSON.parse(payload.data));
+  } else if (payload.kind === 'hangup') {
+    await endCall();
+    showToast(`${peer.name || 'Peer'} ended the call`);
   }
 }
 
@@ -831,6 +840,9 @@ async function endCall(closePanel = true) {
     state.group = null;
   }
   if (state.pc) {
+    if (state.activeCallPeer) {
+      callApp('SendSignal', state.activeCallPeer, 'hangup', JSON.stringify({ reason: 'ended' })).catch(() => {});
+    }
     state.pc.getSenders().forEach((sender) => { try { sender.track?.stop(); } catch (_) {} });
     state.pc.close();
   }

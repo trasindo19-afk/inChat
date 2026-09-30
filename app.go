@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -583,12 +584,12 @@ func loadOrCreateIdentity(name string) (Identity, error) {
 			Fingerprint string `json:"fingerprint"`
 		}
 		if json.Unmarshal(data, &stored) == nil && stored.Certificate != "" && stored.PrivateKey != "" {
-			certPEM, certErr := pem.Decode([]byte(stored.Certificate))
-			keyPEM, keyErr := pem.Decode([]byte(stored.PrivateKey))
-			if certErr == nil && keyErr == nil {
-				key, parseErr := x509.ParseECPrivateKey(keyPEM.Bytes)
+			certBlock, _ := pem.Decode([]byte(stored.Certificate))
+			keyBlock, _ := pem.Decode([]byte(stored.PrivateKey))
+			if certBlock != nil && keyBlock != nil {
+				key, parseErr := x509.ParseECPrivateKey(keyBlock.Bytes)
 				if parseErr == nil {
-					cert := tls.Certificate{Certificate: [][]byte{certPEM.Bytes}, PrivateKey: key}
+					cert := tls.Certificate{Certificate: [][]byte{certBlock.Bytes}, PrivateKey: key}
 					return Identity{ID: stored.ID, Name: name, Fingerprint: stored.Fingerprint, Certificate: cert, PrivateKey: key}, nil
 				}
 			}
@@ -911,6 +912,9 @@ func (a *App) BeginFileTransfer(peerID, path string) (FileTransferInfo, error) {
 	}
 	if info.IsDir() {
 		return FileTransferInfo{}, errors.New("directories are not supported in the MVP")
+	}
+	if info.Size() <= 0 {
+		return FileTransferInfo{}, errors.New("cannot send empty (0-byte) file")
 	}
 	if info.Size() > maxFileSize {
 		return FileTransferInfo{}, fmt.Errorf("file is too large; maximum is %d MB", maxFileSize/(1024*1024))
@@ -1909,10 +1913,22 @@ Write-Output ('OK ' + ($created -join ', '))
 `
 }
 
+// encodePowerShellCommand encodes a PowerShell script or command to base64 UTF-16LE,
+// which is strictly required by powershell.exe -EncodedCommand.
+func encodePowerShellCommand(command string) string {
+	u16 := utf16.Encode([]rune(command))
+	buf := make([]byte, len(u16)*2)
+	for i, r := range u16 {
+		buf[i*2] = byte(r)
+		buf[i*2+1] = byte(r >> 8)
+	}
+	return base64.StdEncoding.EncodeToString(buf)
+}
+
 // runPowerShell executes a script with the signed-in user's privileges and
 // returns combined output.
 func runPowerShell(script string) ([]byte, error) {
-	encoded := base64.StdEncoding.EncodeToString([]byte(script))
+	encoded := encodePowerShellCommand(script)
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded)
 	return cmd.CombinedOutput()
 }
@@ -1937,7 +1953,7 @@ func runPowerShellElevated(script string) error {
 	// Re-launch the script elevated: Start-Process -Verb RunAs is what shows
 	// the standard Windows UAC consent prompt.
 	command := fmt.Sprintf("Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','%s' -Verb RunAs -Wait -PassThru | ForEach-Object { $_.ExitCode }", strings.ReplaceAll(path, "'", "''"))
-	encoded := base64.StdEncoding.EncodeToString([]byte(command))
+	encoded := encodePowerShellCommand(command)
 	output, err := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", firstLine(output, err))
