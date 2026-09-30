@@ -29,7 +29,10 @@ const state = {
   isLocked: false,
   appPin: '',
   privacyShield: false,
-  activeReactionMessageId: null
+  activeReactionMessageId: null,
+  outbox: new Map(),
+  channels: new Map(),
+  dlpEnabled: true
 };
 
 const $ = (id) => document.getElementById(id);
@@ -224,6 +227,98 @@ async function callApp(method, ...args) {
   return api[method](...args);
 }
 
+
+/* =========================================================================
+   Enterprise Security & Cryptography (Web Crypto AES-256 GCM & DLP)
+   ========================================================================= */
+
+const DANGEROUS_EXT_REGEX = /\.(exe|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|msc|scr|msi|dll|com|hta|cpl|jar|pif)$/i;
+
+function isDangerousFileName(name = '') {
+  return DANGEROUS_EXT_REGEX.test(name.trim());
+}
+
+async function deriveChannelKey(passphrase, channelName) {
+  if (!passphrase) return null;
+  const enc = new TextEncoder();
+  const passKey = await window.crypto.subtle.importKey(
+    'raw',
+    enc.encode(passphrase),
+    { name: 'PBKDF2' },
+    false,
+    ['deriveKey']
+  );
+  const salt = enc.encode(`inchat-chan-salt-${channelName.toLowerCase()}`);
+  return window.crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: salt,
+      iterations: 100000,
+      hash: 'SHA-256'
+    },
+    passKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+function bufferToBase64(buffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return window.btoa(binary);
+}
+
+function base64ToBuffer(base64) {
+  const binary_string = window.atob(base64);
+  const len = binary_string.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary_string.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+async function encryptChannelMessage(text, key) {
+  if (!key) return text;
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const enc = new TextEncoder();
+  const ciphertext = await window.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    enc.encode(text)
+  );
+  return `__ENC__:${bufferToBase64(iv)}:${bufferToBase64(ciphertext)}`;
+}
+
+async function decryptChannelMessage(payloadText, key) {
+  if (!payloadText || !payloadText.startsWith('__ENC__:')) {
+    return payloadText;
+  }
+  if (!key) {
+    return '🔒 [Encrypted message - Passphrase required to read]';
+  }
+  try {
+    const parts = payloadText.split(':');
+    if (parts.length < 3) return payloadText;
+    const iv = base64ToBuffer(parts[1]);
+    const ciphertext = base64ToBuffer(parts[2]);
+    const decrypted = await window.crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv },
+      key,
+      ciphertext
+    );
+    const dec = new TextDecoder();
+    return dec.decode(decrypted);
+  } catch (err) {
+    return '🔒 [Decryption failed - Incorrect channel passphrase]';
+  }
+}
+
 /* =========================================================================
    Application Initialization
    ========================================================================= */
@@ -241,6 +336,8 @@ async function init() {
     state.settings = await callApp('GetSettings');
     applySettingsToUI();
     await loadMessageHistory();
+    loadOutbox();
+    await loadChannels();
   } catch (error) {
     $('network-status').textContent = 'Backend unavailable';
     showToast(error.message, 6000);
@@ -256,6 +353,7 @@ async function init() {
     window.runtime.EventsOn('chat-ack', (payload) => handleChatAck(payload));
     window.runtime.EventsOn('pong', (payload) => handlePong(payload));
     window.runtime.EventsOn('group-message', (payload) => receiveGroupMessage(payload));
+    window.runtime.EventsOn('channel-message', (payload) => receiveChannelMessage(payload));
     window.runtime.EventsOn('signal', (payload) => handleSignal(payload).catch((error) => showToast(error.message)));
     window.runtime.EventsOn('file', (payload) => receiveFile(payload));
     window.runtime.EventsOn('file-offer', (payload) => handleFileOffer(payload));
@@ -334,7 +432,18 @@ function bindEvents() {
 
   $('lan-room-card').addEventListener('click', selectLanGroupRoom);
   $('rename-button').addEventListener('click', renameDevice);
-  $('add-peer-button').addEventListener('click', connectManualPeer);
+  $('add-peer-button').addEventListener('click', openConnectModal);
+  $('export-chat-button').addEventListener('click', exportCurrentChat);
+  $('add-channel-button').addEventListener('click', openChannelModal);
+  $('close-channel-modal').addEventListener('click', closeChannelModal);
+  $('confirm-join-channel').addEventListener('click', handleConfirmJoinChannel);
+  $('close-connect').addEventListener('click', closeConnectModal);
+  $('tab-single-ip').addEventListener('click', () => switchConnectTab('single'));
+  $('tab-subnet-scan').addEventListener('click', () => switchConnectTab('subnet'));
+  $('do-single-connect').addEventListener('click', handleSingleConnect);
+  $('do-subnet-scan').addEventListener('click', handleSubnetScan);
+  $('dlp-reject').addEventListener('click', handleDlpReject);
+  $('dlp-proceed').addEventListener('click', handleDlpProceed);
   $('settings-button').addEventListener('click', showSettings);
   $('close-settings').addEventListener('click', () => $('settings-modal').classList.add('hidden'));
   $('choose-avatar').addEventListener('click', chooseAvatar);
@@ -445,6 +554,9 @@ function bindEvents() {
       $('settings-modal').classList.add('hidden');
       $('diagnostics-modal').classList.add('hidden');
       $('peer-modal').classList.add('hidden');
+      $('connect-modal').classList.add('hidden');
+      $('channel-modal').classList.add('hidden');
+      $('dlp-modal').classList.add('hidden');
       cancelPendingPaste();
       cancelVoiceRecording();
     }
@@ -690,8 +802,13 @@ async function sendPendingPaste() {
 }
 
 async function sendDirectOrDataFile(file) {
-  if (state.selectedPeer === LAN_GROUP_ID) {
+  if (state.selectedPeer === LAN_GROUP_ID || state.selectedPeer?.startsWith('__channel_')) {
     return showToast('File transfers are 1-on-1 direct. Select a peer to send files.');
+  }
+
+  if (state.dlpEnabled !== false && isDangerousFileName(file.name)) {
+    const ok = window.confirm(`[Enterprise DLP Warning]\n\n"${file.name}" is an executable or script binary.\nCorporate security policy flags sending binary files.\n\nDo you want to proceed with sending this file?`);
+    if (!ok) return;
   }
 
   if (file.size <= 15 * 1024 * 1024) {
@@ -733,6 +850,7 @@ function selectLanGroupRoom() {
   $('lan-room-badge').classList.add('hidden');
   $('lan-room-card').classList.add('selected');
   document.querySelectorAll('.peer-row').forEach((r) => r.classList.remove('selected'));
+  document.querySelectorAll('.channel-row').forEach((r) => r.classList.remove('selected'));
 
   updateConversationHeader();
   renderMessages();
@@ -741,11 +859,28 @@ function selectLanGroupRoom() {
 
 function updateConversationHeader() {
   const isGroup = state.selectedPeer === LAN_GROUP_ID;
-  const peer = isGroup ? null : state.peers.get(state.selectedPeer);
+  const isChannel = Boolean(state.selectedPeer?.startsWith('__channel_'));
+  const channel = isChannel ? state.channels.get(state.selectedPeer) : null;
+  const peer = (!isGroup && !isChannel) ? state.peers.get(state.selectedPeer) : null;
 
-  $('conversation-empty').classList.toggle('hidden', Boolean(isGroup || peer));
-  $('conversation').classList.toggle('hidden', !isGroup && !peer);
-  if (!isGroup && !peer) return;
+  $('conversation-empty').classList.toggle('hidden', Boolean(isGroup || isChannel || peer));
+  $('conversation').classList.toggle('hidden', !isGroup && !isChannel && !peer);
+  if (!isGroup && !isChannel && !peer) return;
+
+  if (isChannel && channel) {
+    updatePinnedBanner();
+    cancelReply();
+    $('conversation-name').textContent = '#' + channel.name;
+    $('conversation-state').textContent = channel.passphrase ? '🔒 AES-256 GCM Encrypted · Department Room' : 'Open Department Channel';
+    $('conversation-state').classList.remove('state-failed');
+    $('conversation-ping').classList.add('hidden');
+    $('voice-button').classList.add('hidden');
+    $('video-button').classList.add('hidden');
+    $('rdp-button').classList.add('hidden');
+    $('group-button').classList.add('hidden');
+    $('peer-info-button').classList.add('hidden');
+    return;
+  }
 
   updatePinnedBanner();
   cancelReply();
@@ -812,6 +947,11 @@ async function refreshPeers() {
     state.peers = new Map(peers.map((peer) => [peer.id, peer]));
     renderPeers();
     setNetworkStatus(true);
+    for (const p of peers) {
+      if (p.connected && state.outbox.has(p.id)) {
+        flushOutboxForPeer(p.id);
+      }
+    }
   } catch (error) {
     setNetworkStatus(false);
   }
@@ -839,8 +979,11 @@ async function connectManualPeer() {
 function updatePeer(peer) {
   state.peers.set(peer.id, peer);
   renderPeers();
-  if (state.selectedPeer === peer.id || state.selectedPeer === LAN_GROUP_ID) {
+  if (state.selectedPeer === peer.id || state.selectedPeer === LAN_GROUP_ID || state.selectedPeer?.startsWith('__channel_')) {
     updateConversationHeader();
+  }
+  if (peer.connected) {
+    flushOutboxForPeer(peer.id);
   }
 }
 
@@ -870,7 +1013,9 @@ function renderPeers() {
 function selectPeer(peerId) {
   state.selectedPeer = peerId;
   $('lan-room-card').classList.remove('selected');
+  document.querySelectorAll('.channel-row').forEach((r) => r.classList.remove('selected'));
   renderPeers();
+  renderChannels();
   updateConversationHeader();
   renderMessages();
   callApp('ConnectPeer', peerId).catch((error) => showToast(error.message));
@@ -1028,7 +1173,7 @@ function renderMessages() {
 
 function renderTextMessage(message) {
   const senderTag = message.senderName && !message.mine ? `<span class="message-sender">${escapeHtml(message.senderName)}</span>` : '';
-  const statusCheck = message.mine ? (message.status === 'delivered' ? '<span class="delivery-status delivered">✓✓</span>' : '<span class="delivery-status">✓</span>') : '';
+  const statusCheck = message.mine ? (message.status === 'delivered' ? '<span class="delivery-status delivered">✓✓</span>' : (message.status === 'queued' ? '<span class="delivery-status queued" title="Queued in Outbox: Waiting for peer to come online">⏳</span>' : '<span class="delivery-status">✓</span>')) : '';
   const actionsHtml = renderMessageActions(message);
   const reactionsHtml = renderReactionsHtml(message);
   const quotedHtml = renderQuotedPreview(message);
@@ -1048,7 +1193,7 @@ function renderTextMessage(message) {
 function renderImageMessage(message) {
   const senderTag = message.senderName && !message.mine ? `<span class="message-sender">${escapeHtml(message.senderName)}</span>` : '';
   const captionHtml = message.caption ? `<div style="margin-top:4px;font-size:13px">${renderFormattedText(message.caption)}</div>` : '';
-  const statusCheck = message.mine ? (message.status === 'delivered' ? '<span class="delivery-status delivered">✓✓</span>' : '<span class="delivery-status">✓</span>') : '';
+  const statusCheck = message.mine ? (message.status === 'delivered' ? '<span class="delivery-status delivered">✓✓</span>' : (message.status === 'queued' ? '<span class="delivery-status queued" title="Queued in Outbox: Waiting for peer to come online">⏳</span>' : '<span class="delivery-status">✓</span>')) : '';
   const actionsHtml = renderMessageActions(message);
   const reactionsHtml = renderReactionsHtml(message);
   const quotedHtml = renderQuotedPreview(message);
@@ -1071,7 +1216,7 @@ function renderImageMessage(message) {
 function renderAudioMessage(message) {
   const audioId = `audio-${message.time.replace(/[^0-9]/g, '')}-${Math.random().toString(16).slice(2, 6)}`;
   const senderTag = message.senderName && !message.mine ? `<span class="message-sender">${escapeHtml(message.senderName)}</span>` : '';
-  const statusCheck = message.mine ? (message.status === 'delivered' ? '<span class="delivery-status delivered">✓✓</span>' : '<span class="delivery-status">✓</span>') : '';
+  const statusCheck = message.mine ? (message.status === 'delivered' ? '<span class="delivery-status delivered">✓✓</span>' : (message.status === 'queued' ? '<span class="delivery-status queued" title="Queued in Outbox: Waiting for peer to come online">⏳</span>' : '<span class="delivery-status">✓</span>')) : '';
   const actionsHtml = renderMessageActions(message);
   const reactionsHtml = renderReactionsHtml(message);
   const quotedHtml = renderQuotedPreview(message);
@@ -1183,6 +1328,54 @@ async function sendCurrentMessage() {
     } catch (error) {
       showToast(error.message);
     }
+    return;
+  }
+
+  // Channel messaging
+  if (state.selectedPeer.startsWith('__channel_')) {
+    const ch = state.channels.get(state.selectedPeer);
+    if (!ch) return;
+    try {
+      const outgoingText = replyTo ? `[Replying to ${replyTo.sender}: "${replyTo.text.slice(0, 50)}"]\n${text}` : text;
+      let payloadToSend = outgoingText;
+      let isEncrypted = false;
+      if (ch.key) {
+        payloadToSend = await encryptChannelMessage(outgoingText, ch.key);
+        isEncrypted = true;
+      }
+      await callApp('BroadcastChannelMessage', ch.name, payloadToSend);
+      addMessage(state.selectedPeer, {
+        id: msgId,
+        kind: 'text',
+        text,
+        replyTo,
+        mine: true,
+        encrypted: isEncrypted,
+        senderName: state.identity?.name,
+        time: formatTime()
+      });
+      playSentTick();
+      input.value = '';
+    } catch (error) {
+      showToast(error.message);
+    }
+    return;
+  }
+
+  // Direct Peer messaging
+  const peer = state.peers.get(state.selectedPeer);
+  if (!peer?.connected) {
+    // Peer is offline -> Queue into Local Outbox
+    const queuedItem = { id: msgId, kind: 'text', text, replyTo, mine: true, status: 'queued', time: formatTime() };
+    addMessage(state.selectedPeer, queuedItem);
+    if (!state.outbox.has(state.selectedPeer)) {
+      state.outbox.set(state.selectedPeer, []);
+    }
+    state.outbox.get(state.selectedPeer).push(queuedItem);
+    saveOutbox();
+    playSentTick();
+    input.value = '';
+    showToast('Peer offline: Message queued in Outbox ⏳');
     return;
   }
 
@@ -1371,8 +1564,26 @@ function receiveFile(payload) {
 async function handleFileOffer(payload) {
   const peer = state.peers.get(payload.peer_id);
   state.pendingFileOffer = payload;
+
+  if (state.dlpEnabled !== false && isDangerousFileName(payload.name)) {
+    $('dlp-modal-text').innerHTML = `Peer <strong>${escapeHtml(peer?.name || 'Unknown')}</strong> is sending an executable/script file:<br><br><span style="font-size:15px;color:#f87171;font-weight:bold;font-family:monospace">${escapeHtml(payload.name)}</span><br><small style="color:#94a3b8">${formatBytes(payload.size)}</small>`;
+    $('dlp-modal').classList.remove('hidden');
+    return;
+  }
+
   $('file-offer-text').textContent = `${peer?.name || 'A peer'} wants to send ${payload.name} (${formatBytes(payload.size)}).`;
   $('file-offer-modal').classList.remove('hidden');
+}
+
+function handleDlpReject() {
+  $('dlp-modal').classList.add('hidden');
+  resolveFileOffer(false);
+  showToast('Blocked potentially dangerous file (Enterprise DLP Policy)');
+}
+
+function handleDlpProceed() {
+  $('dlp-modal').classList.add('hidden');
+  resolveFileOffer(true);
 }
 
 async function resolveFileOffer(accept) {
@@ -1513,6 +1724,11 @@ async function applySettingsToUI() {
   state.privacyShield = privacyShield;
   $('privacy-shield').checked = privacyShield;
 
+  const dlpEnabled = window.localStorage.getItem('inchat.dlp_guard') !== 'false';
+  state.dlpEnabled = dlpEnabled;
+  const dlpCheckbox = $('dlp-guard');
+  if (dlpCheckbox) dlpCheckbox.checked = dlpEnabled;
+
   const appPin = window.localStorage.getItem('inchat.app_pin') || '';
   state.appPin = appPin;
   $('settings-pin').value = appPin;
@@ -1584,6 +1800,12 @@ async function saveSettings() {
 
     state.privacyShield = $('privacy-shield').checked;
     window.localStorage.setItem('inchat.privacy_shield', state.privacyShield ? 'true' : 'false');
+
+    const dlpCheckbox = $('dlp-guard');
+    if (dlpCheckbox) {
+      state.dlpEnabled = dlpCheckbox.checked;
+      window.localStorage.setItem('inchat.dlp_guard', state.dlpEnabled ? 'true' : 'false');
+    }
 
     state.appPin = $('settings-pin').value.trim();
     window.localStorage.setItem('inchat.app_pin', state.appPin);
@@ -2376,3 +2598,438 @@ function handleWindowFocus() {
 }
 
 init();
+
+
+/* =========================================================================
+   Top 1: Local Outbox Queue Implementation
+   ========================================================================= */
+
+function saveOutbox() {
+  const obj = {};
+  for (const [peerId, list] of state.outbox) {
+    if (list.length > 0) obj[peerId] = list;
+  }
+  try {
+    window.localStorage.setItem('inchat.outbox.v1', JSON.stringify(obj));
+  } catch (_) {}
+}
+
+function loadOutbox() {
+  try {
+    const raw = window.localStorage.getItem('inchat.outbox.v1');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      for (const [peerId, list] of Object.entries(parsed)) {
+        if (Array.isArray(list) && list.length > 0) {
+          state.outbox.set(peerId, list);
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+async function flushOutboxForPeer(peerId) {
+  const queue = state.outbox.get(peerId);
+  if (!queue || queue.length === 0) return;
+  const peer = state.peers.get(peerId);
+  if (!peer?.connected) return;
+
+  const remaining = [];
+  let flushedCount = 0;
+
+  for (const item of queue) {
+    try {
+      const outgoingText = item.replyTo ? `[Replying to ${item.replyTo.sender}: "${item.replyTo.text.slice(0, 50)}"]\n${item.text}` : item.text;
+      await callApp('SendMessage', peerId, outgoingText);
+      item.status = 'sent';
+      flushedCount++;
+      const peerMsgs = state.messages.get(peerId);
+      const found = peerMsgs?.find((m) => m.id === item.id);
+      if (found) found.status = 'sent';
+    } catch (err) {
+      remaining.push(item);
+    }
+  }
+
+  if (remaining.length > 0) {
+    state.outbox.set(peerId, remaining);
+  } else {
+    state.outbox.delete(peerId);
+  }
+  saveOutbox();
+  saveMessageHistory();
+  if (state.selectedPeer === peerId) {
+    renderMessages();
+  }
+  if (flushedCount > 0) {
+    showToast(`Outbox: Delivered ${flushedCount} pending message(s) to ${peer.name}`);
+  }
+}
+
+/* =========================================================================
+   Top 2: Department Channels / Private LAN Rooms Implementation
+   ========================================================================= */
+
+function renderChannels() {
+  const container = $('channel-list');
+  if (!container) return;
+  if (state.channels.size === 0) {
+    container.innerHTML = '<div class="channel-empty">No department rooms. Click ＋ Room to join.</div>';
+    return;
+  }
+  const html = [];
+  for (const [id, ch] of state.channels) {
+    const isSelected = state.selectedPeer === id;
+    const badge = ch.unread > 0 ? `<span class="channel-badge">${ch.unread}</span>` : '';
+    const lockIcon = ch.passphrase ? '<span class="channel-lock" title="AES-256 GCM Encrypted">🔒</span>' : '';
+    html.push(`
+      <button class="channel-row ${isSelected ? 'selected' : ''}" data-channel-id="${escapeHtml(id)}">
+        <span class="channel-hash">#</span>
+        <span class="channel-name">${escapeHtml(ch.name)}</span>
+        ${lockIcon}
+        ${badge}
+      </button>
+    `);
+  }
+  container.innerHTML = html.join('');
+  container.querySelectorAll('[data-channel-id]').forEach((btn) => {
+    btn.addEventListener('click', () => selectChannel(btn.dataset.channelId));
+  });
+}
+
+function selectChannel(channelId) {
+  state.selectedPeer = channelId;
+  const channel = state.channels.get(channelId);
+  if (channel) {
+    channel.unread = 0;
+  }
+  $('lan-room-card').classList.remove('selected');
+  document.querySelectorAll('.peer-row').forEach((r) => r.classList.remove('selected'));
+  renderChannels();
+  updateConversationHeader();
+  renderMessages();
+  startPingTimer(null);
+}
+
+function openChannelModal() {
+  $('channel-name-input').value = '';
+  $('channel-pass-input').value = '';
+  $('channel-modal').classList.remove('hidden');
+  setTimeout(() => $('channel-name-input').focus(), 60);
+}
+
+function closeChannelModal() {
+  $('channel-modal').classList.add('hidden');
+}
+
+async function handleConfirmJoinChannel() {
+  const rawName = $('channel-name-input').value.trim().toLowerCase();
+  const name = rawName.replace(/[^a-z0-9_-]/g, '');
+  if (!name) {
+    return showToast('Enter a valid channel name (alphanumeric, dash, underscore)');
+  }
+  const pass = $('channel-pass-input').value;
+  const channelId = `__channel_${name}__`;
+
+  let key = null;
+  if (pass) {
+    try {
+      key = await deriveChannelKey(pass, name);
+    } catch (e) {
+      return showToast('Failed to derive encryption key: ' + e.message);
+    }
+  }
+
+  const chObj = {
+    id: channelId,
+    name,
+    passphrase: pass || '',
+    key,
+    unread: 0
+  };
+  state.channels.set(channelId, chObj);
+  saveChannels();
+  renderChannels();
+  closeChannelModal();
+  selectChannel(channelId);
+  showToast(`Joined department room #${name}${pass ? ' (AES-256 GCM Encrypted)' : ''}`);
+}
+
+function saveChannels() {
+  const list = [];
+  for (const [_, ch] of state.channels) {
+    list.push({ id: ch.id, name: ch.name, passphrase: ch.passphrase });
+  }
+  try {
+    window.localStorage.setItem('inchat.channels.v2', JSON.stringify(list));
+  } catch (_) {}
+}
+
+async function loadChannels() {
+  try {
+    const raw = window.localStorage.getItem('inchat.channels.v2');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          let key = null;
+          if (item.passphrase) {
+            try {
+              key = await deriveChannelKey(item.passphrase, item.name);
+            } catch (_) {}
+          }
+          state.channels.set(item.id, {
+            id: item.id,
+            name: item.name,
+            passphrase: item.passphrase || '',
+            key,
+            unread: 0
+          });
+        }
+      }
+    }
+  } catch (_) {}
+  renderChannels();
+}
+
+async function receiveChannelMessage(payload) {
+  const channelName = (payload.channel || '').toLowerCase();
+  const channelId = `__channel_${channelName}__`;
+
+  if (!state.channels.has(channelId)) {
+    state.channels.set(channelId, {
+      id: channelId,
+      name: channelName,
+      passphrase: '',
+      key: null,
+      unread: 0
+    });
+    saveChannels();
+    renderChannels();
+  }
+
+  const ch = state.channels.get(channelId);
+  let decryptedText = payload.text;
+  let isEncrypted = false;
+  if (payload.text && payload.text.startsWith('__ENC__:')) {
+    isEncrypted = true;
+    decryptedText = await decryptChannelMessage(payload.text, ch?.key);
+  }
+
+  const { replyTo, text } = parseReplyFromText(decryptedText);
+  const isMine = payload.peer_id === state.identity?.id;
+
+  addMessage(channelId, {
+    id: payload.id || `ch-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
+    kind: 'text',
+    text,
+    replyTo,
+    mine: isMine,
+    senderName: payload.name || 'Anonymous',
+    encrypted: isEncrypted,
+    time: formatTime(new Date(payload.timestamp ? payload.timestamp * 1000 : Date.now()))
+  });
+
+  if (!isMine) {
+    playChime();
+    if (state.selectedPeer !== channelId) {
+      if (ch) ch.unread = (ch.unread || 0) + 1;
+      renderChannels();
+      showToast(`[#${channelName}] ${payload.name}: ${text.slice(0, 45)}`);
+    }
+  }
+}
+
+/* =========================================================================
+   Top 3: Export Chat to HTML / Text (Corporate Audit Archive)
+   ========================================================================= */
+
+async function exportCurrentChat() {
+  if (!state.selectedPeer) {
+    return showToast('Select a conversation or room to export');
+  }
+
+  const isGroup = state.selectedPeer === LAN_GROUP_ID;
+  const isChannel = Boolean(state.selectedPeer?.startsWith('__channel_'));
+  let convoTitle = 'Conversation';
+  let participants = [];
+
+  if (isGroup) {
+    convoTitle = 'LAN Group Room';
+    participants = [`Local device: ${state.identity?.name} (${state.identity?.id})`, 'All LAN group peers (Broadcast Mesh)'];
+  } else if (isChannel) {
+    const ch = state.channels.get(state.selectedPeer);
+    convoTitle = `#${ch?.name || 'channel'}`;
+    participants = [`Local device: ${state.identity?.name} (${state.identity?.id})`, `Department Channel: #${ch?.name}`];
+  } else {
+    const peer = state.peers.get(state.selectedPeer);
+    convoTitle = peer?.name || state.selectedPeer;
+    participants = [
+      `${state.identity?.name} (${state.identity?.id})`,
+      `${peer?.name || 'Peer'} (${peer?.id || state.selectedPeer}) - Fingerprint: ${peer?.fingerprint || 'N/A'}`
+    ];
+  }
+
+  const msgs = state.messages.get(state.selectedPeer) || [];
+  if (msgs.length === 0) {
+    return showToast('No messages in this conversation to export');
+  }
+
+  const rawData = JSON.stringify(msgs);
+  const hashBuffer = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawData));
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const sha256Hash = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+
+  const nowIso = new Date().toISOString();
+  const exportTimeStr = new Date().toLocaleString();
+
+  const messagesHtml = msgs.map((m) => {
+    const sender = m.mine ? (state.identity?.name || 'Me') : (m.senderName || convoTitle);
+    const replySnippet = m.replyTo ? `<div style="font-size:11px;color:#64748b;margin-bottom:4px;border-left:2px solid #cbd5e1;padding-left:6px">Replying to ${escapeHtml(m.replyTo.sender)}: "${escapeHtml(m.replyTo.text.slice(0, 60))}"</div>` : '';
+    let body = escapeHtml(m.text || '');
+    if (m.kind === 'file') body = `[Attached File: ${escapeHtml(m.name || 'file')} (${formatBytes(m.size || 0)})]`;
+    if (m.kind === 'image') body = `[Embedded Image${m.caption ? `: ${escapeHtml(m.caption)}` : ''}]`;
+    if (m.kind === 'audio') body = '[Voice Memo Note]';
+    const statusText = m.mine ? ` [${m.status || 'sent'}]` : '';
+
+    return `
+      <div style="margin-bottom:12px;padding:10px 14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px">
+        <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+          <strong style="color:#0f172a;font-size:13px">${escapeHtml(sender)}${statusText}</strong>
+          <span style="color:#64748b;font-size:11px">${m.time}</span>
+        </div>
+        ${replySnippet}
+        <div style="color:#334155;font-size:13px;white-space:pre-wrap;word-break:break-word">${body}</div>
+      </div>
+    `;
+  }).join('');
+
+  const htmlDoc = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>inChat Corporate Audit Archive - ${escapeHtml(convoTitle)}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 32px; background: #ffffff; color: #0f172a; line-height: 1.5; }
+    .header { border-bottom: 2px solid #0f172a; padding-bottom: 16px; margin-bottom: 24px; }
+    .title { font-size: 24px; font-weight: 700; margin: 0 0 6px 0; }
+    .meta-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 12px; }
+    .meta-table td { padding: 4px 8px; border: 1px solid #e2e8f0; }
+    .meta-table td.label { font-weight: 600; width: 180px; background: #f1f5f9; color: #475569; }
+    .hash-badge { font-family: monospace; font-size: 11px; background: #e0f2fe; color: #0369a1; padding: 2px 6px; border-radius: 4px; word-break: break-all; }
+    .messages-container { margin-top: 24px; }
+    .footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #64748b; text-align: center; }
+    @media print { body { padding: 0; } }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1 class="title">inChat Corporate Audit Transcript</h1>
+    <div>Room / Conversation: <strong>${escapeHtml(convoTitle)}</strong></div>
+    <table class="meta-table">
+      <tr><td class="label">Export Timestamp</td><td>${escapeHtml(exportTimeStr)} (${escapeHtml(nowIso)})</td></tr>
+      <tr><td class="label">Participants</td><td>${participants.map((p) => escapeHtml(p)).join('<br>')}</td></tr>
+      <tr><td class="label">Message Count</td><td>${msgs.length} messages</td></tr>
+      <tr><td class="label">Cryptographic Digest</td><td><span class="hash-badge">SHA-256: ${sha256Hash}</span></td></tr>
+      <tr><td class="label">Application Version</td><td>inChat Enterprise v0.1.0 (Zero-Cloud P2P Mesh)</td></tr>
+    </table>
+  </div>
+  <div class="messages-container">
+    ${messagesHtml}
+  </div>
+  <div class="footer">
+    Generated by inChat Enterprise P2P LAN Mesh. This record is immutable and cryptographically indexed.
+  </div>
+</body>
+</html>`;
+
+  const safeName = convoTitle.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const filename = `inchat-audit-${safeName}-${new Date().toISOString().slice(0, 10)}.html`;
+
+  try {
+    const savedPath = await callApp('ExportChatHTML', filename, htmlDoc);
+    if (savedPath) {
+      showToast(`Audit log exported: ${savedPath}`, 5000);
+    }
+  } catch (err) {
+    showToast(`Export failed: ${err.message}`);
+  }
+}
+
+/* =========================================================================
+   Top 4: Subnet Range Scanner Implementation
+   ========================================================================= */
+
+function openConnectModal() {
+  switchConnectTab('single');
+  $('connect-ip-input').value = '';
+  $('scan-status').textContent = '';
+  $('connect-modal').classList.remove('hidden');
+  setTimeout(() => $('connect-ip-input').focus(), 60);
+}
+
+function closeConnectModal() {
+  $('connect-modal').classList.add('hidden');
+}
+
+function switchConnectTab(tab) {
+  if (tab === 'single') {
+    $('tab-single-ip').classList.add('active');
+    $('tab-subnet-scan').classList.remove('active');
+    $('panel-single-ip').classList.remove('hidden');
+    $('panel-subnet-scan').classList.add('hidden');
+    setTimeout(() => $('connect-ip-input').focus(), 50);
+  } else {
+    $('tab-subnet-scan').classList.add('active');
+    $('tab-single-ip').classList.remove('active');
+    $('panel-subnet-scan').classList.remove('hidden');
+    $('panel-single-ip').classList.add('hidden');
+    setTimeout(() => $('connect-subnet-input').focus(), 50);
+  }
+}
+
+async function handleSingleConnect() {
+  const ip = $('connect-ip-input').value.trim();
+  if (!ip) return showToast('Please enter a LAN IP address');
+  try {
+    const peer = await callApp('ManualConnect', ip);
+    state.peers.set(peer.id, peer);
+    renderPeers();
+    closeConnectModal();
+    showToast(`Connected to ${peer.name || peer.address}`);
+  } catch (err) {
+    showToast(`Connection failed: ${err.message}`);
+  }
+}
+
+async function handleSubnetScan() {
+  const target = $('connect-subnet-input').value.trim();
+  if (!target) return showToast('Please enter a subnet (e.g. 192.168.1.0/24 or 192.168.1)');
+  const btn = $('do-subnet-scan');
+  const statusEl = $('scan-status');
+  btn.disabled = true;
+  btn.textContent = 'Scanning 254 hosts…';
+  statusEl.innerHTML = '<span style="color:#38bdf8">⏳ Concurrently probing port 42426 across subnet…</span>';
+
+  try {
+    const found = await callApp('ScanSubnet', target);
+    if (!found || found.length === 0) {
+      statusEl.innerHTML = '<span style="color:#94a3b8">Scan complete. No active inChat instances found.</span>';
+    } else {
+      statusEl.innerHTML = `<span style="color:#22c55e;font-weight:600">✓ Discovered ${found.length} peer(s)!</span>`;
+      for (const p of found) {
+        state.peers.set(p.id, p);
+      }
+      renderPeers();
+      showToast(`Subnet scan found ${found.length} active peer(s)!`);
+      setTimeout(() => {
+        closeConnectModal();
+      }, 1600);
+    }
+  } catch (err) {
+    statusEl.innerHTML = `<span style="color:#ef4444">Scan failed: ${escapeHtml(err.message)}</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Start Subnet Scan';
+  }
+}

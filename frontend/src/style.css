@@ -341,3 +341,30 @@ body.app-locked main, body.app-locked header { filter: blur(12px); pointer-event
 
 @keyframes slideDown { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes popIn { from { opacity: 0; transform: scale(0.85); } to { opacity: 1; transform: scale(1); } }
+
+/* Department Channels */
+.channel-list { display: flex; flex-direction: column; gap: 2px; max-height: 140px; overflow-y: auto; margin-bottom: 6px; }
+.channel-row { width: 100%; display: flex; align-items: center; gap: 8px; padding: 7px 10px; border: 1px solid transparent; border-radius: 8px; color: #cbd5e1; background: transparent; text-align: left; font-size: 13px; cursor: pointer; transition: all 0.12s ease; }
+.channel-row:hover { background: #131c2e; border-color: #1e293b; }
+.channel-row.selected { background: rgba(56, 189, 248, 0.12); border-color: rgba(56, 189, 248, 0.35); color: #38bdf8; font-weight: 600; }
+.channel-hash { color: #64748b; font-family: monospace; font-size: 14px; font-weight: bold; }
+.channel-row.selected .channel-hash { color: #38bdf8; }
+.channel-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.channel-lock { font-size: 11px; opacity: 0.75; }
+.channel-badge { padding: 1px 5px; border-radius: 99px; background: #ef4444; color: #fff; font-size: 9px; font-weight: 700; margin-left: auto; }
+.channel-empty { padding: 8px 10px; color: #64748b; font-size: 11px; font-style: italic; }
+
+/* Delivery Status (Outbox Queue) */
+.delivery-status.queued { color: #f59e0b; opacity: 0.9; }
+
+/* Connect Modal Tabs */
+.tab-row { display: flex; gap: 6px; border-bottom: 1px solid #1e293b; padding-bottom: 10px; margin-bottom: 12px; }
+.tab-btn { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 600; color: #94a3b8; cursor: pointer; transition: all 0.12s ease; }
+.tab-btn:hover { color: #e2e8f0; background: #131c2e; }
+.tab-btn.active { color: #38bdf8; background: #1e293b; border-color: #334155; }
+
+/* DLP Security Alert */
+.dlp-card { width: min(420px, calc(100vw - 32px)); text-align: center; }
+.dlp-icon { font-size: 42px; margin-bottom: 8px; filter: drop-shadow(0 2px 8px rgba(239, 68, 68, 0.3)); }
+.danger-btn { background: #dc2626 !important; border-color: #ef4444 !important; color: #ffffff !important; }
+.danger-btn:hover { background: #b91c1c !important; }

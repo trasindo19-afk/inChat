@@ -42,6 +42,9 @@
             </button>
           </div>
 
+          <div class="sidebar-heading"><span>Department Rooms</span><span class="heading-actions"><button id="add-channel-button" class="mini-button" title="Join or create private room">＋ Room</button></span></div>
+          <div id="channel-list" class="channel-list"></div>
+
           <div class="sidebar-heading"><span>People on your LAN</span><span class="heading-actions"><button id="add-peer-button" class="mini-button" title="Connect by IP">＋ IP</button><span id="peer-count" class="count">0</span></span></div>
           <div id="peer-list" class="peer-list"><div class="empty-state">Looking for peers…</div></div>
           <div class="sidebar-footer"><span class="dot green"></span><span>Direct peer-to-peer</span></div>
@@ -66,7 +69,7 @@
           <div id="conversation" class="conversation-content hidden">
             <div class="conversation-header">
               <div><h2 id="conversation-name">Peer</h2><div class="header-meta"><small id="conversation-state">offline</small><span id="conversation-ping" class="ping-pill hidden">⚡ 1ms</span></div></div>
-              <div class="call-actions"><button id="search-button" class="icon-button" title="Search messages (Ctrl+F)">🔍</button><button id="voice-button" class="call-button" title="Voice call">☎</button><button id="video-button" class="call-button" title="Video call">▣</button><button id="group-button" class="call-button" title="Group call">G</button><button id="rdp-button" class="call-button" title="Open Windows RDP">RDP</button><button id="peer-info-button" class="icon-button" title="Peer safety code">ⓘ</button></div>
+              <div class="call-actions"><button id="export-chat-button" class="icon-button" title="Export Chat (HTML Audit Archive)">📥</button><button id="search-button" class="icon-button" title="Search messages (Ctrl+F)">🔍</button><button id="voice-button" class="call-button" title="Voice call">☎</button><button id="video-button" class="call-button" title="Video call">▣</button><button id="group-button" class="call-button" title="Group call">G</button><button id="rdp-button" class="call-button" title="Open Windows RDP">RDP</button><button id="peer-info-button" class="icon-button" title="Peer safety code">ⓘ</button></div>
             </div>
 
             <div id="search-bar" class="search-bar hidden">
@@ -127,13 +130,71 @@
       </main>
 
       <div id="toast" class="toast hidden"></div>
-      <div id="settings-modal" class="modal hidden"><div class="modal-card settings-card"><div class="modal-header"><h2>Settings</h2><button id="close-settings" class="icon-button">×</button></div><div class="settings-form"><div class="settings-profile"><div id="settings-avatar-preview" class="avatar avatar-large"><span id="settings-avatar-fallback">I</span><img id="settings-avatar-image" class="avatar-image" alt="" hidden /></div><div><button id="choose-avatar" class="secondary-button">Change photo</button><p class="settings-hint">PNG, JPG, WEBP, or GIF. Max 5 MB.</p></div></div><label>Display name<input id="settings-display-name" type="text" maxlength="64" /></label><label>Received files folder<div class="folder-row"><input id="settings-receive-folder" type="text" readonly /><button id="choose-folder" class="secondary-button">Choose</button></div></label><label class="checkbox-row"><input id="auto-accept-files" type="checkbox" /><span>Automatically save incoming files</span></label><label class="checkbox-row"><input id="sound-notifications" type="checkbox" checked /><span>Play sound effects (chimes, ringtone, message sent)</span></label><label class="checkbox-row"><input id="auto-start-boot" type="checkbox" /><span>Start inChat automatically when Windows boots</span></label><label class="checkbox-row"><input id="privacy-shield" type="checkbox" /><span>Privacy Shield: Auto-blur chats when inChat loses window focus</span></label><label>App Lock PIN (4 digits)<input id="settings-pin" type="password" maxlength="4" placeholder="Leave empty for no PIN" /></label><label>Theme<select id="settings-theme"><option value="dark">Dark</option><option value="light">Light</option><option value="system">Follow system</option></select></label><label>Update feed URL<input id="settings-update-feed" type="text" placeholder="https://api.github.com/repos/OWNER/inChat/releases/latest" /></label><div class="update-actions"><button id="check-update" class="secondary-button">Check for updates</button><span id="update-status" class="settings-hint"></span></div><button id="save-settings" class="send-button settings-save">Save settings</button></div></div></div>
+      <div id="settings-modal" class="modal hidden"><div class="modal-card settings-card"><div class="modal-header"><h2>Settings</h2><button id="close-settings" class="icon-button">×</button></div><div class="settings-form"><div class="settings-profile"><div id="settings-avatar-preview" class="avatar avatar-large"><span id="settings-avatar-fallback">I</span><img id="settings-avatar-image" class="avatar-image" alt="" hidden /></div><div><button id="choose-avatar" class="secondary-button">Change photo</button><p class="settings-hint">PNG, JPG, WEBP, or GIF. Max 5 MB.</p></div></div><label>Display name<input id="settings-display-name" type="text" maxlength="64" /></label><label>Received files folder<div class="folder-row"><input id="settings-receive-folder" type="text" readonly /><button id="choose-folder" class="secondary-button">Choose</button></div></label><label class="checkbox-row"><input id="auto-accept-files" type="checkbox" /><span>Automatically save incoming files</span></label><label class="checkbox-row"><input id="sound-notifications" type="checkbox" checked /><span>Play sound effects (chimes, ringtone, message sent)</span></label><label class="checkbox-row"><input id="auto-start-boot" type="checkbox" /><span>Start inChat automatically when Windows boots</span></label><label class="checkbox-row"><input id="privacy-shield" type="checkbox" /><span>Privacy Shield: Auto-blur chats when inChat loses window focus</span></label><label class="checkbox-row"><input id="dlp-guard" type="checkbox" checked /><span>Enterprise DLP: Warn before accepting or running executable files (.exe, .bat, .ps1)</span></label><label>App Lock PIN (4 digits)<input id="settings-pin" type="password" maxlength="4" placeholder="Leave empty for no PIN" /></label><label>Theme<select id="settings-theme"><option value="dark">Dark</option><option value="light">Light</option><option value="system">Follow system</option></select></label><label>Update feed URL<input id="settings-update-feed" type="text" placeholder="https://api.github.com/repos/OWNER/inChat/releases/latest" /></label><div class="update-actions"><button id="check-update" class="secondary-button">Check for updates</button><span id="update-status" class="settings-hint"></span></div><button id="save-settings" class="send-button settings-save">Save settings</button></div></div></div>
       <div id="diagnostics-modal" class="modal hidden"><div class="modal-card"><div class="modal-header"><h2>Diagnostics</h2><button id="close-diagnostics" class="icon-button">×</button></div><pre id="diagnostics-content"></pre><button id="copy-diagnostics" class="send-button">Copy diagnostics</button></div></div>
       <div id="file-offer-modal" class="modal hidden"><div class="modal-card file-offer-card"><div class="modal-header"><h2>Incoming file</h2></div><div class="file-offer-icon">▧</div><p id="file-offer-text"></p><div class="modal-actions"><button id="reject-file" class="secondary-button">Reject</button><button id="accept-file" class="send-button">Accept</button></div></div></div>
       <div id="peer-modal" class="modal hidden"><div class="modal-card"><div class="modal-header"><h2>Peer safety code</h2><button id="close-peer-info" class="icon-button">×</button></div><div id="peer-emoji-card" class="peer-emoji-card"><span class="emoji-label">Visual Verification Code</span><div id="peer-emoji-display" class="peer-emoji-display">🚀 🍕 🎯 ⚡</div></div><p id="peer-info-text"></p><button id="copy-peer-info" class="send-button">Copy safety code</button></div></div>
       <div id="image-modal" class="modal hidden"><div class="modal-card image-card"><div class="modal-header"><h2 id="image-modal-title">Image preview</h2><div class="modal-header-actions"><button id="image-modal-fullscreen" class="icon-button" title="Toggle Fullscreen">⛶</button><button id="close-image-modal" class="icon-button" title="Close">✕</button></div></div><div class="image-modal-stage"><img id="image-modal-img" alt="" /></div><div class="modal-actions"><span id="image-modal-meta" class="settings-hint" style="margin-right:auto;align-self:center"></span><a id="image-modal-download" class="secondary-button" download="image.png">Save image</a></div></div></div>
       <div id="doodle-modal" class="modal hidden"><div class="modal-card doodle-card"><div class="modal-header"><h2>Quick Sketch & Doodle</h2><button id="close-doodle" class="icon-button">✕</button></div><div class="doodle-toolbar"><div class="color-palette"><button class="color-btn active" style="background:#ef4444" data-color="#ef4444"></button><button class="color-btn" style="background:#3b82f6" data-color="#3b82f6"></button><button class="color-btn" style="background:#10b981" data-color="#10b981"></button><button class="color-btn" style="background:#f59e0b" data-color="#f59e0b"></button><button class="color-btn" style="background:#ffffff" data-color="#ffffff"></button></div><button id="doodle-clear" class="secondary-button">Clear</button></div><canvas id="doodle-canvas" width="440" height="260"></canvas><div class="modal-actions"><button id="cancel-doodle" class="secondary-button">Cancel</button><button id="send-doodle" class="send-button">Send sketch</button></div></div></div>
       <div id="lock-modal" class="modal hidden"><div class="modal-card lock-card"><div class="lock-icon">🔒</div><h2>inChat Locked</h2><p class="settings-hint">Enter your 4-digit PIN to unlock</p><input id="pin-input" type="password" maxlength="4" placeholder="••••" /><div class="modal-actions" style="justify-content:center"><button id="unlock-button" class="send-button" style="width:100%">Unlock</button></div></div></div>
+      <div id="connect-modal" class="modal hidden">
+        <div class="modal-card">
+          <div class="modal-header">
+            <h2>Connect to LAN Peer / Subnet</h2>
+            <button id="close-connect" class="icon-button">×</button>
+          </div>
+          <div class="settings-form">
+            <div class="tab-row">
+              <button id="tab-single-ip" class="tab-btn active">Single IP</button>
+              <button id="tab-subnet-scan" class="tab-btn">Subnet Range Scanner</button>
+            </div>
+            <div id="panel-single-ip">
+              <label>Peer LAN IP address
+                <input id="connect-ip-input" type="text" placeholder="192.168.1.50" />
+              </label>
+              <button id="do-single-connect" class="send-button" style="margin-top:10px;width:100%">Connect to IP</button>
+            </div>
+            <div id="panel-subnet-scan" class="hidden">
+              <label>Subnet (CIDR or prefix)
+                <input id="connect-subnet-input" type="text" placeholder="192.168.20.0/24 or 192.168.20" />
+              </label>
+              <p class="settings-hint">Probes all 254 IP addresses across corporate VLANs or floors</p>
+              <button id="do-subnet-scan" class="send-button" style="margin-top:10px;width:100%">Start Subnet Scan</button>
+              <div id="scan-status" class="settings-hint" style="margin-top:8px;text-align:center"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="channel-modal" class="modal hidden">
+        <div class="modal-card">
+          <div class="modal-header">
+            <h2>Department Channel</h2>
+            <button id="close-channel-modal" class="icon-button">×</button>
+          </div>
+          <div class="settings-form">
+            <label>Channel name (e.g. finance, it-ops, hrd)
+              <input id="channel-name-input" type="text" maxlength="32" placeholder="finance" />
+            </label>
+            <label>Passphrase (Optional - End-to-End AES-256 GCM)
+              <input id="channel-pass-input" type="password" placeholder="Leave empty for open department room" />
+            </label>
+            <p class="settings-hint">Only peers with the exact same passphrase can decrypt and read department messages.</p>
+            <button id="confirm-join-channel" class="send-button" style="margin-top:8px">Join Channel</button>
+          </div>
+        </div>
+      </div>
+      <div id="dlp-modal" class="modal hidden">
+        <div class="modal-card dlp-card">
+          <div class="dlp-icon">🛡️</div>
+          <h2>Security Alert: Executable Script</h2>
+          <p id="dlp-modal-text"></p>
+          <p class="settings-hint">Corporate DLP policy: Scripts and executable binaries can perform system actions. Only proceed if you trust the peer.</p>
+          <div class="modal-actions" style="justify-content:center;gap:12px">
+            <button id="dlp-reject" class="secondary-button">Block & Cancel</button>
+            <button id="dlp-proceed" class="send-button danger-btn">Proceed Anyway</button>
+          </div>
+        </div>
+      </div>
     </div>
     <script type="module" src="/src/main.js"></script>
   </body>

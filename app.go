@@ -937,6 +937,148 @@ func (a *App) BroadcastMessage(text string) error {
 	return lastErr
 }
 
+func (a *App) BroadcastChannelMessage(channel, text string) error {
+	channel = strings.TrimSpace(channel)
+	text = strings.TrimSpace(text)
+	if channel == "" || text == "" {
+		return errors.New("channel and message cannot be empty")
+	}
+	if len([]byte(text)) > 64*1024 {
+		return errors.New("message is too large")
+	}
+	a.mu.RLock()
+	activePeers := make([]string, 0, len(a.peers))
+	for id, p := range a.peers {
+		if p.conn != nil {
+			activePeers = append(activePeers, id)
+		}
+	}
+	a.mu.RUnlock()
+	if len(activePeers) == 0 {
+		return errors.New("no peers currently online in LAN room")
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"channel": channel,
+		"text":    text,
+		"name":    a.identity.Name,
+	})
+	var lastErr error
+	for _, peerID := range activePeers {
+		if err := a.sendEnvelope(peerID, "channel-chat", payload); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+func incIP(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
+	}
+}
+
+func (a *App) ScanSubnet(target string) ([]PeerInfo, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil, errors.New("subnet or IP range is required")
+	}
+
+	var ips []string
+	if strings.Contains(target, "/") {
+		ip, ipnet, err := net.ParseCIDR(target)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR: %w", err)
+		}
+		for curr := ip.Mask(ipnet.Mask); ipnet.Contains(curr); incIP(curr) {
+			curr4 := curr.To4()
+			if curr4 != nil && curr4[3] != 0 && curr4[3] != 255 {
+				ips = append(ips, curr4.String())
+			}
+		}
+	} else if strings.Count(target, ".") == 3 {
+		ips = append(ips, target)
+	} else if strings.Count(target, ".") == 2 {
+		for i := 1; i <= 254; i++ {
+			ips = append(ips, fmt.Sprintf("%s.%d", target, i))
+		}
+	} else {
+		return nil, errors.New("format must be CIDR (e.g. 192.168.1.0/24) or prefix (e.g. 192.168.1)")
+	}
+
+	if len(ips) == 0 {
+		return nil, errors.New("no IP addresses to scan")
+	}
+	if len(ips) > 512 {
+		return nil, errors.New("subnet scan limited to maximum 512 IP addresses")
+	}
+
+	type scanResult struct {
+		peer PeerInfo
+		ok   bool
+	}
+	resultsChan := make(chan scanResult, len(ips))
+	sem := make(chan struct{}, 40)
+
+	var wg sync.WaitGroup
+	for _, ip := range ips {
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			endpoint := net.JoinHostPort(addr, fmt.Sprintf("%d", controlPort))
+			conn, err := net.DialTimeout("tcp4", endpoint, 350*time.Millisecond)
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+
+			peerInfo, err := a.ManualConnect(endpoint)
+			if err == nil {
+				resultsChan <- scanResult{peer: peerInfo, ok: true}
+			}
+		}(ip)
+	}
+
+	wg.Wait()
+	close(resultsChan)
+
+	var found []PeerInfo
+	for r := range resultsChan {
+		if r.ok {
+			found = append(found, r.peer)
+		}
+	}
+	return found, nil
+}
+
+func (a *App) ExportChatHTML(defaultFilename, htmlContent string) (string, error) {
+	if a.ctx == nil {
+		return "", errors.New("application is not ready")
+	}
+	if defaultFilename == "" {
+		defaultFilename = fmt.Sprintf("inChat-Audit-%s.html", time.Now().Format("20060102-150405"))
+	}
+	savePath, err := wailsruntime.SaveFileDialog(a.ctx, wailsruntime.SaveDialogOptions{
+		Title:           "Export Chat Archive",
+		DefaultFilename: defaultFilename,
+		Filters: []wailsruntime.FileFilter{
+			{DisplayName: "HTML Archive (*.html)", Pattern: "*.html"},
+		},
+	})
+	if err != nil || savePath == "" {
+		return "", err
+	}
+	if err := os.WriteFile(savePath, []byte(htmlContent), 0600); err != nil {
+		return "", err
+	}
+	return savePath, nil
+}
+
 func (a *App) SendFileDirect(peerID, name, mimeType, dataBase64 string) error {
 	name = filepath.Base(strings.TrimSpace(name))
 	if name == "" || name == "." {
@@ -1784,6 +1926,33 @@ func (a *App) handleEnvelope(peerID string, message envelope) {
 			a.emit("pin", map[string]any{
 				"peer_id": peerID,
 				"text":    pinData.Text,
+			})
+		}
+	case "channel-chat":
+		if len(message.Payload) > 64*1024 {
+			return
+		}
+		var chPayload struct {
+			Channel string `json:"channel"`
+			Text    string `json:"text"`
+			Name    string `json:"name"`
+		}
+		if json.Unmarshal(message.Payload, &chPayload) == nil && chPayload.Channel != "" {
+			senderName := chPayload.Name
+			if senderName == "" {
+				a.mu.RLock()
+				if p, ok := a.peers[peerID]; ok {
+					senderName = p.info.Name
+				}
+				a.mu.RUnlock()
+			}
+			a.notify(chPayload.Channel, fmt.Sprintf("%s: %s", senderName, chPayload.Text))
+			a.emit("channel-message", map[string]any{
+				"id":      message.ID,
+				"peer_id": peerID,
+				"channel": chPayload.Channel,
+				"name":    senderName,
+				"text":    chPayload.Text,
 			})
 		}
 	case "group-chat":
