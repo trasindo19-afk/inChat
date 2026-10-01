@@ -30,9 +30,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unicode/utf16"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -2199,60 +2199,56 @@ func (a *App) discoveryLoop() {
 	}
 }
 
-// CheckFirewall reports whether Windows Firewall currently allows inbound LAN
-// traffic for inChat (discovery UDP45450 / control TCP45451) and lists the
-// active network profile so the user can compare it against the rules.
+// CheckFirewall reports whether Windows Firewall currently allows inbound LAN traffic for inChat.
 func (a *App) CheckFirewall() map[string]any {
 	result := map[string]any{
-		"available": false,
-		"allowed":   false,
+		"available": true,
+		"allowed":   true,
 		"port":      controlPort,
 		"udp_port":  discoveryPort,
 		"exe":       "",
-		"message":   "",
+		"message":   "Windows Firewall allows inChat traffic.",
 	}
 	exe, err := os.Executable()
 	if err == nil {
 		result["exe"] = exe
 	}
-	script := firewallStatusScript(exe)
-	output, err := runPowerShell(script)
-	if err != nil {
-		result["message"] = fmt.Sprintf("could not query Windows Firewall: %s", firstLine(output, err))
-		return result
+
+	cmd := exec.Command("netsh.exe", "advfirewall", "firewall", "show", "rule", "name=inChat")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000,
 	}
-	var parsed struct {
-		Allowed  bool     `json:"allowed"`
-		Profiles []string `json:"profiles"`
-		Rules    []struct {
-			Name    string `json:"name"`
-			Enabled bool   `json:"enabled"`
-		} `json:"rules"`
-	}
-	if json.Unmarshal(output, &parsed) != nil {
-		result["message"] = fmt.Sprintf("unexpected firewall query output: %s", firstLine(output, nil))
-		return result
-	}
-	result["available"] = true
-	result["allowed"] = parsed.Allowed
-	result["profiles"] = parsed.Profiles
-	result["rules"] = parsed.Rules
-	if parsed.Allowed {
+	out, err := cmd.CombinedOutput()
+	outStr := string(out)
+	if err != nil || !strings.Contains(outStr, "Action:") || strings.Contains(outStr, "No rules match") {
+		result["allowed"] = false
+		result["message"] = fmt.Sprintf("Windows Firewall is missing an inbound allow rule for inChat (UDP %d / TCP %d).", discoveryPort, controlPort)
+	} else if strings.Contains(strings.ToLower(outStr), "allow") {
+		result["allowed"] = true
 		result["message"] = "Windows Firewall is allowing inChat."
-	} else {
-		result["message"] = fmt.Sprintf("Windows Firewall is missing an inbound allow rule for UDP %d and TCP %d. Peers will be discovered but cannot connect.", discoveryPort, controlPort)
 	}
 	return result
 }
 
-// AllowFirewall adds the two inbound allow rules. Windows requires elevation,
-// so this triggers the standard UAC prompt; cancelling it is reported back to
-// the UI instead of failing silently.
+// AllowFirewall adds the inbound allow rule using native Windows netsh.exe via UAC elevation.
 func (a *App) AllowFirewall() (map[string]any, error) {
-	script := firewallAllowScript()
-	if err := runPowerShellElevated(script); err != nil {
-		return a.CheckFirewall(), fmt.Errorf("Windows Firewall access was not granted: %w", err)
+	exe, err := os.Executable()
+	if err != nil {
+		return a.CheckFirewall(), err
 	}
+
+	args := fmt.Sprintf(`advfirewall firewall add rule name="inChat" dir=in action=allow program="%s" enable=yes profile=any`, exe)
+	verbPtr := windows.StringToUTF16Ptr("runas")
+	filePtr := windows.StringToUTF16Ptr("netsh.exe")
+	argsPtr := windows.StringToUTF16Ptr(args)
+
+	err = windows.ShellExecute(0, verbPtr, filePtr, argsPtr, nil, windows.SW_HIDE)
+	if err != nil {
+		return a.CheckFirewall(), fmt.Errorf("firewall access was not granted: %w", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
 	return a.CheckFirewall(), nil
 }
 
@@ -2260,128 +2256,6 @@ func (a *App) AllowFirewall() (map[string]any, error) {
 // the user can review or change rules manually.
 func (a *App) OpenFirewallSettings() error {
 	return exec.Command("control.exe", "firewall.cpl").Start()
-}
-
-const firewallScriptHeader = `
-$ErrorActionPreference = 'SilentlyContinue'
-$names = @('inChat Discovery','inChat Control')
-$rules = @()
-foreach ($n in $names) {
-  foreach ($r in @(Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue)) {
-    $rules += [pscustomobject]@{ name = [string]$r.DisplayName; enabled = [bool]$r.Enabled }
-  }
-}
-`
-
-func firewallStatusScript(exe string) string {
-	exeLiteral := strings.ReplaceAll(exe, "'", "''")
-	return firewallScriptHeader + fmt.Sprintf(`
-$exe = '%s'
-foreach ($r in @(Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | ForEach-Object { $_ | Get-NetFirewallRule -ErrorAction SilentlyContinue })) {
-  if ($r.Direction.ToString() -eq 'Inbound' -and $r.Action.ToString() -eq 'Allow' -and [bool]$r.Enabled) {
-    $rules += [pscustomobject]@{ name = [string]$r.DisplayName; enabled = [bool]$r.Enabled }
-  }
-}
-$profiles = @()
-foreach ($p in @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)) { $profiles += [string]$p.NetworkCategory }
-$needed = @('inChat Discovery','inChat Control')
-$allowed = $true
-foreach ($n in $needed) {
-  $found = $false
-  foreach ($r in $rules) { if ($r.name -eq $n -and $r.enabled) { $found = $true } }
-  if (-not $found) { $allowed = $false }
-}
-[pscustomobject]@{ allowed = [bool]$allowed; profiles = $profiles; rules = $rules } | ConvertTo-Json -Depth 6 -Compress
-`, exeLiteral)
-}
-
-func firewallAllowScript() string {
-	return firewallScriptHeader + `
-$created = @()
-foreach ($pair in @(
-  @{ n = 'inChat Discovery'; p = 'UDP'; port = 45450 },
-  @{ n = 'inChat Control';   p = 'TCP'; port = 45451 }
-)) {
-  Get-NetFirewallRule -DisplayName $pair.n -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-  $rule = New-NetFirewallRule -DisplayName $pair.n -Direction Inbound -Action Allow -Enabled True -Profile Any -Protocol $pair.p -LocalPort $pair.port
-  $created += [string]$rule.DisplayName
-}
-Write-Output ('OK ' + ($created -join ', '))
-`
-}
-
-// encodePowerShellCommand encodes a PowerShell script or command to base64 UTF-16LE,
-// which is strictly required by powershell.exe -EncodedCommand.
-func encodePowerShellCommand(command string) string {
-	u16 := utf16.Encode([]rune(command))
-	buf := make([]byte, len(u16)*2)
-	for i, r := range u16 {
-		buf[i*2] = byte(r)
-		buf[i*2+1] = byte(r >> 8)
-	}
-	return base64.StdEncoding.EncodeToString(buf)
-}
-
-// runPowerShell executes a script with the signed-in user's privileges and
-// returns combined output without flashing any console window.
-func runPowerShell(script string) ([]byte, error) {
-	encoded := encodePowerShellCommand(script)
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow:    true,
-		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
-	}
-	return cmd.CombinedOutput()
-}
-
-// runPowerShellElevated runs the script through UAC elevation. The temp script
-// is written with restrictive permissions and removed afterwards.
-func runPowerShellElevated(script string) error {
-	file, err := os.CreateTemp(os.TempDir(), "inchat-firewall-*.ps1")
-	if err != nil {
-		return err
-	}
-	path := file.Name()
-	defer os.Remove(path)
-	if _, err := file.WriteString(script); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-
-	// Re-launch the script elevated: Start-Process -Verb RunAs is what shows
-	// the standard Windows UAC consent prompt.
-	command := fmt.Sprintf("Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','%s' -Verb RunAs -Wait -PassThru | ForEach-Object { $_.ExitCode }", strings.ReplaceAll(path, "'", "''"))
-	encoded := encodePowerShellCommand(command)
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow:    true,
-		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
-	}
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s", firstLine(output, err))
-	}
-	if code := strings.TrimSpace(string(output)); code != "" && code != "0" {
-		return fmt.Errorf("firewall helper exited with code %s", code)
-	}
-	return nil
-}
-
-func firstLine(output []byte, fallback error) error {
-	line := strings.TrimSpace(string(output))
-	if line == "" {
-		if fallback != nil {
-			return fallback
-		}
-		return errors.New("no output")
-	}
-	if index := strings.IndexByte(line, '\n'); index > 0 {
-		line = strings.TrimSpace(line[:index])
-	}
-	return errors.New(line)
 }
 
 func (a *App) emitPeer(info PeerInfo) {

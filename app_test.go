@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -49,21 +48,14 @@ func TestIsAllowedLANAddress(t *testing.T) {
 	}
 }
 
-func TestEncodePowerShellCommand(t *testing.T) {
-	cmd := "Write-Output 'OK'"
-	encoded := encodePowerShellCommand(cmd)
-	raw, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		t.Fatalf("base64 decode: %v", err)
+func TestCheckFirewallReturnsStructure(t *testing.T) {
+	app := &App{}
+	fw := app.CheckFirewall()
+	if fw == nil {
+		t.Fatal("expected non-nil firewall map")
 	}
-	if len(raw) != len(cmd)*2 {
-		t.Fatalf("expected UTF-16LE byte count %d, got %d", len(cmd)*2, len(raw))
-	}
-	// Verify little-endian ASCII: every odd byte is 0 for standard ASCII chars
-	for i := 0; i < len(cmd); i++ {
-		if raw[i*2] != cmd[i] || raw[i*2+1] != 0 {
-			t.Fatalf("character %d mismatch: got (%d, %d), expected (%d, 0)", i, raw[i*2], raw[i*2+1], cmd[i])
-		}
+	if _, ok := fw["port"]; !ok {
+		t.Fatal("expected port in firewall map")
 	}
 }
 
