@@ -28,10 +28,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf16"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+	"golang.org/x/sys/windows/registry"
 )
 
 const (
@@ -1147,25 +1149,38 @@ func (a *App) GetAutoStart() bool {
 	if err != nil {
 		return false
 	}
-	out, err := runPowerShell("(Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -ErrorAction SilentlyContinue).inChat")
-	if err != nil || len(bytes.TrimSpace(out)) == 0 {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.QUERY_VALUE)
+	if err != nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(string(out)), strings.ToLower(filepath.Base(exePath)))
+	defer k.Close()
+
+	val, _, err := k.GetStringValue("inChat")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(val), strings.ToLower(filepath.Base(exePath)))
 }
 
 func (a *App) SetAutoStart(enabled bool) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+
 	if enabled {
 		exePath, err := os.Executable()
 		if err != nil {
 			return err
 		}
-		cmd := fmt.Sprintf("Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'inChat' -Value '\"%s\"'", exePath)
-		_, err = runPowerShell(cmd)
+		return k.SetStringValue("inChat", fmt.Sprintf(`"%s"`, exePath))
+	}
+	err = k.DeleteValue("inChat")
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return err
 	}
-	_, err := runPowerShell("Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'inChat' -ErrorAction SilentlyContinue")
-	return err
+	return nil
 }
 
 func (a *App) PingPeer(peerID string, ts int64) error {
@@ -2308,10 +2323,14 @@ func encodePowerShellCommand(command string) string {
 }
 
 // runPowerShell executes a script with the signed-in user's privileges and
-// returns combined output.
+// returns combined output without flashing any console window.
 func runPowerShell(script string) ([]byte, error) {
 	encoded := encodePowerShellCommand(script)
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded)
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+	}
 	return cmd.CombinedOutput()
 }
 
@@ -2336,7 +2355,12 @@ func runPowerShellElevated(script string) error {
 	// the standard Windows UAC consent prompt.
 	command := fmt.Sprintf("Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','%s' -Verb RunAs -Wait -PassThru | ForEach-Object { $_.ExitCode }", strings.ReplaceAll(path, "'", "''"))
 	encoded := encodePowerShellCommand(command)
-	output, err := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded).CombinedOutput()
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+	}
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", firstLine(output, err))
 	}
