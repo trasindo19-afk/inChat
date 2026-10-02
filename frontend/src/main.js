@@ -870,8 +870,9 @@ function updateConversationHeader() {
   if (isChannel && channel) {
     updatePinnedBanner();
     cancelReply();
-    $('conversation-name').textContent = '#' + channel.name;
-    $('conversation-state').textContent = channel.passphrase ? '🔒 AES-256 GCM Encrypted · Department Room' : 'Open Department Channel';
+    $('conversation-name').textContent = channel.name;
+    const roomSub = channel.creatorName ? `Department Room · Created by ${channel.creatorName}` : 'Department Room';
+    $('conversation-state').textContent = channel.passphrase ? `🔒 AES-256 GCM Encrypted · ${roomSub}` : roomSub;
     $('conversation-state').classList.remove('state-failed');
     $('conversation-ping').classList.add('hidden');
     $('voice-button').classList.add('hidden');
@@ -2678,23 +2679,77 @@ function renderChannels() {
     return;
   }
   const html = [];
+  const myId = state.identity?.id;
+  const myName = state.identity?.name;
+
   for (const [id, ch] of state.channels) {
     const isSelected = state.selectedPeer === id;
     const badge = ch.unread > 0 ? `<span class="channel-badge">${ch.unread}</span>` : '';
     const lockIcon = ch.passphrase ? '<span class="channel-lock" title="AES-256 GCM Encrypted">🔒</span>' : '';
+    
+    // Creator check: if creator matches local ID/name or if not recorded (legacy local room)
+    const isCreator = !ch.creator || ch.creator === myId || ch.creator === myName || ch.creatorName === myName;
+    const actionBtn = isCreator
+      ? `<button class="channel-action-btn channel-delete-btn" data-del-channel="${escapeHtml(id)}" title="Delete Department Room (Creator)">🗑️</button>`
+      : `<button class="channel-action-btn channel-leave-btn" data-del-channel="${escapeHtml(id)}" title="Leave Room">✕</button>`;
+
     html.push(`
-      <button class="channel-row ${isSelected ? 'selected' : ''}" data-channel-id="${escapeHtml(id)}">
-        <span class="channel-hash">#</span>
-        <span class="channel-name">${escapeHtml(ch.name)}</span>
-        ${lockIcon}
-        ${badge}
-      </button>
+      <div class="channel-row-wrapper ${isSelected ? 'selected' : ''}">
+        <button class="channel-row ${isSelected ? 'selected' : ''}" data-channel-id="${escapeHtml(id)}">
+          <span class="channel-icon" title="Department Room">🏢</span>
+          <span class="channel-name" title="${escapeHtml(ch.name)}${ch.creatorName ? ' (Created by ' + escapeHtml(ch.creatorName) + ')' : ''}">${escapeHtml(ch.name)}</span>
+          ${lockIcon}
+          ${badge}
+        </button>
+        ${actionBtn}
+      </div>
     `);
   }
   container.innerHTML = html.join('');
   container.querySelectorAll('[data-channel-id]').forEach((btn) => {
     btn.addEventListener('click', () => selectChannel(btn.dataset.channelId));
   });
+  container.querySelectorAll('[data-del-channel]').forEach((btn) => {
+    btn.addEventListener('click', (e) => handleDeleteChannel(btn.dataset.delChannel, e));
+  });
+}
+
+async function handleDeleteChannel(channelId, e) {
+  if (e) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+  const ch = state.channels.get(channelId);
+  if (!ch) return;
+
+  const myId = state.identity?.id;
+  const myName = state.identity?.name;
+  const isCreator = !ch.creator || ch.creator === myId || ch.creator === myName || ch.creatorName === myName;
+  const actionLabel = isCreator ? 'delete' : 'leave';
+
+  if (!confirm(`Are you sure you want to ${actionLabel} department room "${ch.name}"?`)) return;
+
+  // If creator, broadcast room deletion notice to peers
+  if (isCreator && window.go && window.go.main && window.go.main.App) {
+    try {
+      await callApp('BroadcastChannelMessage', ch.name, `__ROOM_DELETED__:${ch.name}`);
+    } catch (_) {}
+  }
+
+  state.channels.delete(channelId);
+  if (state.messages && state.messages[channelId]) {
+    delete state.messages[channelId];
+  }
+  saveChannels();
+
+  if (state.selectedPeer === channelId) {
+    state.selectedPeer = null;
+    $('lan-room-card')?.classList.add('selected');
+    updateConversationHeader();
+    renderMessages();
+  }
+  renderChannels();
+  showToast(`Room "${ch.name}" ${isCreator ? 'deleted' : 'left'}`);
 }
 
 function selectChannel(channelId) {
@@ -2723,18 +2778,25 @@ function closeChannelModal() {
 }
 
 async function handleConfirmJoinChannel() {
-  const rawName = $('channel-name-input').value.trim().toLowerCase();
-  const name = rawName.replace(/[^a-z0-9_-]/g, '');
-  if (!name) {
-    return showToast('Enter a valid channel name (alphanumeric, dash, underscore)');
+  const rawInput = $('channel-name-input').value.trim();
+  if (!rawInput) {
+    return showToast('Please enter a room name');
   }
-  const pass = $('channel-pass-input').value;
-  const channelId = `__channel_${name}__`;
+  // Sanitize control characters and collapse whitespace, preserving natural casing and symbols (&, -, etc.)
+  const cleanName = rawInput.replace(/[\x00-\x1F\x7F]/g, '').replace(/\s+/g, ' ').slice(0, 40);
+  if (!cleanName) {
+    return showToast('Please enter a valid room name');
+  }
 
+  // Normalized channel ID for internal routing
+  const normalizedSlug = cleanName.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+  const channelId = `__channel_${normalizedSlug || cleanName.toLowerCase()}__`;
+
+  const pass = $('channel-pass-input').value;
   let key = null;
   if (pass) {
     try {
-      key = await deriveChannelKey(pass, name);
+      key = await deriveChannelKey(pass, cleanName);
     } catch (e) {
       return showToast('Failed to derive encryption key: ' + e.message);
     }
@@ -2742,23 +2804,33 @@ async function handleConfirmJoinChannel() {
 
   const chObj = {
     id: channelId,
-    name,
+    name: cleanName,
     passphrase: pass || '',
     key,
-    unread: 0
+    unread: 0,
+    creator: state.identity?.id || state.identity?.name || '',
+    creatorName: state.identity?.name || 'Local User',
+    createdAt: Date.now()
   };
   state.channels.set(channelId, chObj);
   saveChannels();
   renderChannels();
   closeChannelModal();
   selectChannel(channelId);
-  showToast(`Joined department room #${name}${pass ? ' (AES-256 GCM Encrypted)' : ''}`);
+  showToast(`Joined department room "${cleanName}"${pass ? ' (AES-256 GCM Encrypted)' : ''}`);
 }
 
 function saveChannels() {
   const list = [];
   for (const [_, ch] of state.channels) {
-    list.push({ id: ch.id, name: ch.name, passphrase: ch.passphrase });
+    list.push({
+      id: ch.id,
+      name: ch.name,
+      passphrase: ch.passphrase,
+      creator: ch.creator || '',
+      creatorName: ch.creatorName || '',
+      createdAt: ch.createdAt || Date.now()
+    });
   }
   try {
     window.localStorage.setItem('inchat.channels.v2', JSON.stringify(list));
@@ -2783,7 +2855,10 @@ async function loadChannels() {
             name: item.name,
             passphrase: item.passphrase || '',
             key,
-            unread: 0
+            unread: 0,
+            creator: item.creator || '',
+            creatorName: item.creatorName || '',
+            createdAt: item.createdAt || Date.now()
           });
         }
       }
@@ -2793,16 +2868,40 @@ async function loadChannels() {
 }
 
 async function receiveChannelMessage(payload) {
-  const channelName = (payload.channel || '').toLowerCase();
-  const channelId = `__channel_${channelName}__`;
+  const rawChannelName = (payload.channel || '').trim();
+  if (!rawChannelName) return;
+
+  const normalizedSlug = rawChannelName.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+  const channelId = `__channel_${normalizedSlug || rawChannelName.toLowerCase()}__`;
+
+  // Check for room deletion broadcast
+  if (payload.text && payload.text.startsWith('__ROOM_DELETED__:')) {
+    const deletedName = payload.text.replace('__ROOM_DELETED__:', '').trim();
+    showToast(`Department room "${deletedName || rawChannelName}" was closed by creator.`);
+    if (state.channels.has(channelId)) {
+      state.channels.delete(channelId);
+      saveChannels();
+      if (state.selectedPeer === channelId) {
+        state.selectedPeer = null;
+        $('lan-room-card')?.classList.add('selected');
+        updateConversationHeader();
+        renderMessages();
+      }
+      renderChannels();
+    }
+    return;
+  }
 
   if (!state.channels.has(channelId)) {
     state.channels.set(channelId, {
       id: channelId,
-      name: channelName,
+      name: rawChannelName,
       passphrase: '',
       key: null,
-      unread: 0
+      unread: 0,
+      creator: payload.peer_id || payload.sender || '',
+      creatorName: payload.name || '',
+      createdAt: Date.now()
     });
     saveChannels();
     renderChannels();
@@ -2835,7 +2934,7 @@ async function receiveChannelMessage(payload) {
     if (state.selectedPeer !== channelId) {
       if (ch) ch.unread = (ch.unread || 0) + 1;
       renderChannels();
-      showToast(`[#${channelName}] ${payload.name}: ${text.slice(0, 45)}`);
+      showToast(`[${rawChannelName}] ${payload.name}: ${text.slice(0, 45)}`);
     }
   }
 }
@@ -2859,8 +2958,8 @@ async function exportCurrentChat() {
     participants = [`Local device: ${state.identity?.name} (${state.identity?.id})`, 'All LAN group peers (Broadcast Mesh)'];
   } else if (isChannel) {
     const ch = state.channels.get(state.selectedPeer);
-    convoTitle = `#${ch?.name || 'channel'}`;
-    participants = [`Local device: ${state.identity?.name} (${state.identity?.id})`, `Department Channel: #${ch?.name}`];
+    convoTitle = ch?.name || 'Department Room';
+    participants = [`Local device: ${state.identity?.name} (${state.identity?.id})`, `Department Room: ${ch?.name || 'Department Room'}`];
   } else {
     const peer = state.peers.get(state.selectedPeer);
     convoTitle = peer?.name || state.selectedPeer;

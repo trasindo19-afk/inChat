@@ -178,28 +178,65 @@ button { cursor: pointer; }
 .lan-room-badge { padding: 1px 5px; border-radius: 10px; background: #da3633; color: #fff; font-size: 10px; font-weight: 600; margin-left: auto; }
 
 /* Department Channels */
-.channel-list { display: flex; flex-direction: column; gap: 1px; max-height: 140px; overflow-y: auto; }
+.channel-list { display: flex; flex-direction: column; gap: 2px; max-height: 160px; overflow-y: auto; }
+.channel-row-wrapper {
+  display: flex;
+  align-items: center;
+  position: relative;
+  border-radius: 6px;
+  transition: background 0.1s ease;
+}
+.channel-row-wrapper:hover {
+  background: #21262d;
+}
+.channel-row-wrapper.selected {
+  background: #21262d;
+}
 .channel-row {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 9px;
+  padding: 6px 8px;
   border: 1px solid transparent;
   border-radius: 6px;
   color: #c9d1d9;
   background: transparent;
   text-align: left;
   font-size: 13px;
+  cursor: pointer;
   transition: background 0.1s ease;
 }
-.channel-row:hover { background: #21262d; }
-.channel-row.selected { background: #21262d; color: #58a6ff; font-weight: 500; }
-.channel-hash { color: #8b949e; font-family: monospace; font-size: 13px; font-weight: bold; }
-.channel-row.selected .channel-hash { color: #58a6ff; }
+.channel-row.selected {
+  color: #58a6ff;
+  font-weight: 500;
+}
+.channel-icon { font-size: 13px; line-height: 1; opacity: 0.9; }
 .channel-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .channel-lock { font-size: 10px; opacity: 0.7; }
 .channel-badge { padding: 1px 5px; border-radius: 10px; background: #da3633; color: #fff; font-size: 9px; font-weight: 600; margin-left: auto; }
+.channel-action-btn {
+  background: transparent;
+  border: none;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 3px 5px;
+  margin-right: 4px;
+  border-radius: 4px;
+  opacity: 0;
+  color: #8b949e;
+  line-height: 1;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+.channel-row-wrapper:hover .channel-action-btn {
+  opacity: 0.7;
+}
+.channel-action-btn:hover {
+  opacity: 1 !important;
+  color: #f85149;
+  background: rgba(248, 81, 73, 0.2);
+}
 .channel-empty { padding: 6px 8px; color: #6e7681; font-size: 11px; }
 
 /* Headings */
@@ -485,12 +522,12 @@ body.theme-light .lan-room-info strong { color: #1f2328; }
 body.theme-light .lan-room-icon { background: #eaeef2; }
 body.theme-light .lan-room-card.selected .lan-room-icon { background: #ddf4ff; }
 
+body.theme-light .channel-row-wrapper:hover { background: #eaeef2; }
+body.theme-light .channel-row-wrapper.selected { background: #ddf4ff; }
 body.theme-light .channel-row { color: #24292f; }
-body.theme-light .channel-row:hover { background: #eaeef2; }
-body.theme-light .channel-row.selected { background: #ddf4ff; color: #0969da; }
-body.theme-light .channel-hash { color: #656d76; }
-body.theme-light .channel-row.selected .channel-hash { color: #0969da; }
+body.theme-light .channel-row.selected { color: #0969da; }
 body.theme-light .channel-empty { color: #656d76; }
+body.theme-light .channel-action-btn:hover { background: rgba(207, 34, 46, 0.15); }
 
 body.theme-light .peer-row { color: #24292f; }
 body.theme-light .peer-row:hover { background: #eaeef2; }
