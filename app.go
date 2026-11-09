@@ -44,6 +44,7 @@ const (
 	protocolVer   = 1
 	fileChunkSize = 256 * 1024
 	appVersion    = "0.1.0"
+	defaultUpdateFeedURL = "https://api.github.com/repos/trasindo19-afk/inChat/releases/latest"
 )
 
 const (
@@ -333,18 +334,22 @@ func loadSettings() Settings {
 		DisplayName:     defaultDeviceName(),
 		ReceiveFolder:   defaultReceiveFolder(),
 		AutoAcceptFiles: false,
+		UpdateFeedURL:   defaultUpdateFeedURL,
 		Theme:           "dark",
 		AutoStart:       true,
 	}
 	data, err := os.ReadFile(settingsPath())
 	if err == nil && json.Unmarshal(data, &settings) != nil {
-		settings = Settings{DisplayName: defaultDeviceName(), ReceiveFolder: defaultReceiveFolder(), AutoStart: true}
+		settings = Settings{DisplayName: defaultDeviceName(), ReceiveFolder: defaultReceiveFolder(), UpdateFeedURL: defaultUpdateFeedURL, AutoStart: true}
 	}
 	if strings.TrimSpace(settings.DisplayName) == "" {
 		settings.DisplayName = defaultDeviceName()
 	}
 	if strings.TrimSpace(settings.ReceiveFolder) == "" {
 		settings.ReceiveFolder = defaultReceiveFolder()
+	}
+	if strings.TrimSpace(settings.UpdateFeedURL) == "" {
+		settings.UpdateFeedURL = defaultUpdateFeedURL
 	}
 	if settings.Theme != "dark" && settings.Theme != "light" && settings.Theme != "system" {
 		settings.Theme = "dark"
@@ -415,19 +420,31 @@ func (a *App) SetUpdateFeedURL(feedURL string) error {
 
 func (a *App) CheckForUpdates() (UpdateInfo, error) {
 	a.mu.RLock()
-	feedURL := a.settings.UpdateFeedURL
+	feedURL := strings.TrimSpace(a.settings.UpdateFeedURL)
 	a.mu.RUnlock()
-	info := UpdateInfo{CurrentVersion: appVersion, LatestVersion: appVersion}
 	if feedURL == "" {
-		info.Message = "Update feed is not configured"
-		return info, nil
+		feedURL = defaultUpdateFeedURL
 	}
+	info := UpdateInfo{CurrentVersion: appVersion, LatestVersion: appVersion}
+
 	client := &http.Client{Timeout: 10 * time.Second}
-	response, err := client.Get(feedURL)
+	req, err := http.NewRequest("GET", feedURL, nil)
+	if err != nil {
+		return info, err
+	}
+	req.Header.Set("User-Agent", "inChat-Desktop-Updater/"+appVersion)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	response, err := client.Do(req)
 	if err != nil {
 		return info, err
 	}
 	defer response.Body.Close()
+
+	if response.StatusCode == http.StatusNotFound {
+		info.Message = "Belum ada rilis baru di GitHub repository"
+		return info, nil
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return info, fmt.Errorf("update server returned HTTP %d", response.StatusCode)
 	}
@@ -462,7 +479,13 @@ func (a *App) DownloadUpdate(downloadURL string) (string, error) {
 		return "", errors.New("update download must use HTTPS")
 	}
 	client := &http.Client{Timeout: 10 * time.Minute}
-	response, err := client.Get(downloadURL)
+	req, err := http.NewRequest("GET", downloadURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "inChat-Desktop-Updater/"+appVersion)
+
+	response, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
