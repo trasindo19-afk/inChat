@@ -67,22 +67,26 @@ type IdentityInfo struct {
 }
 
 type Settings struct {
-	DisplayName     string `json:"displayName"`
-	ReceiveFolder   string `json:"receiveFolder"`
-	AutoAcceptFiles bool   `json:"autoAcceptFiles"`
-	AvatarData      string `json:"avatarData"`
-	AvatarMIME      string `json:"avatarMime"`
-	UpdateFeedURL   string `json:"updateFeedUrl"`
-	Theme           string `json:"theme"`
+	DisplayName     string   `json:"displayName"`
+	ReceiveFolder   string   `json:"receiveFolder"`
+	AutoAcceptFiles bool     `json:"autoAcceptFiles"`
+	AvatarData      string   `json:"avatarData"`
+	AvatarMIME      string   `json:"avatarMime"`
+	UpdateFeedURL   string   `json:"updateFeedUrl"`
+	Theme           string   `json:"theme"`
+	KnownSubnets    []string `json:"knownSubnets"`
+	AutoStart       bool     `json:"autoStart"`
 }
 
 type SettingsInfo struct {
-	DisplayName     string `json:"displayName"`
-	ReceiveFolder   string `json:"receiveFolder"`
-	AutoAcceptFiles bool   `json:"autoAcceptFiles"`
-	AvatarData      string `json:"avatarData"`
-	UpdateFeedURL   string `json:"updateFeedUrl"`
-	Theme           string `json:"theme"`
+	DisplayName     string   `json:"displayName"`
+	ReceiveFolder   string   `json:"receiveFolder"`
+	AutoAcceptFiles bool     `json:"autoAcceptFiles"`
+	AvatarData      string   `json:"avatarData"`
+	UpdateFeedURL   string   `json:"updateFeedUrl"`
+	Theme           string   `json:"theme"`
+	KnownSubnets    []string `json:"knownSubnets"`
+	AutoStart       bool     `json:"autoStart"`
 }
 
 type UpdateInfo struct {
@@ -104,6 +108,7 @@ type PeerInfo struct {
 	LastError    string    `json:"lastError,omitempty"`
 	LastSeen     time.Time `json:"lastSeen"`
 	Capabilities []string  `json:"capabilities"`
+	Avatar       string    `json:"avatar,omitempty"`
 }
 
 type peer struct {
@@ -329,10 +334,11 @@ func loadSettings() Settings {
 		ReceiveFolder:   defaultReceiveFolder(),
 		AutoAcceptFiles: false,
 		Theme:           "dark",
+		AutoStart:       true,
 	}
 	data, err := os.ReadFile(settingsPath())
 	if err == nil && json.Unmarshal(data, &settings) != nil {
-		settings = Settings{DisplayName: defaultDeviceName(), ReceiveFolder: defaultReceiveFolder()}
+		settings = Settings{DisplayName: defaultDeviceName(), ReceiveFolder: defaultReceiveFolder(), AutoStart: true}
 	}
 	if strings.TrimSpace(settings.DisplayName) == "" {
 		settings.DisplayName = defaultDeviceName()
@@ -369,6 +375,8 @@ func (a *App) GetSettings() SettingsInfo {
 		AvatarData:      a.settings.AvatarData,
 		UpdateFeedURL:   a.settings.UpdateFeedURL,
 		Theme:           a.settings.Theme,
+		KnownSubnets:    append([]string(nil), a.settings.KnownSubnets...),
+		AutoStart:       a.GetAutoStart(),
 	}
 }
 
@@ -571,6 +579,9 @@ func (a *App) ChooseAvatar() (SettingsInfo, error) {
 	a.settings.AvatarData = "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)
 	err = saveSettings(a.settings)
 	a.mu.Unlock()
+	if err == nil {
+		a.startTracked(a.broadcastAvatar)
+	}
 	return a.GetSettings(), err
 }
 
@@ -661,15 +672,116 @@ func (a *App) startup(ctx context.Context) {
 	}
 	a.listener = listener
 
-	a.wg.Add(2)
+	a.wg.Add(3)
 	go a.acceptLoop(listener)
 	go a.discoveryLoop()
+	go a.peerReaperLoop()
 	a.startTray()
+	a.syncAutoStart()
 
 	a.emit("status", map[string]any{
 		"message": "inChat is running",
 		"port":    controlPort,
 	})
+}
+
+func (a *App) peerReaperLoop() {
+	defer a.wg.Done()
+	ticker := time.NewTicker(4 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-a.stop:
+			return
+		case <-ticker.C:
+			a.pruneStalePeers()
+		}
+	}
+}
+
+func (a *App) pruneStalePeers() {
+	a.mu.Lock()
+	onlineNames := make(map[string]bool)
+	onlineHosts := make(map[string]bool)
+	for _, p := range a.peers {
+		if p.conn != nil {
+			if name := strings.TrimSpace(p.info.Name); name != "" {
+				onlineNames[strings.ToLower(name)] = true
+			}
+			if host := extractHost(p.info.Address); host != "" {
+				onlineHosts[host] = true
+			}
+		}
+	}
+
+	changed := false
+	now := time.Now()
+	for id, p := range a.peers {
+		if p.conn != nil {
+			continue
+		}
+		nameLower := strings.ToLower(strings.TrimSpace(p.info.Name))
+		host := extractHost(p.info.Address)
+
+		// 1. Online peer already exists with same name -> delete stale ghost
+		if nameLower != "" && onlineNames[nameLower] {
+			delete(a.peers, id)
+			changed = true
+			continue
+		}
+		// 2. Online peer already exists on same IP host -> delete stale ghost
+		if host != "" && onlineHosts[host] {
+			delete(a.peers, id)
+			changed = true
+			continue
+		}
+		// 3. Stale record with certificate fingerprint mismatch -> delete
+		if strings.Contains(p.lastError, "fingerprint does not match") {
+			delete(a.peers, id)
+			changed = true
+			continue
+		}
+		// 4. Stale discovered peers not seen in last 45 seconds -> delete
+		if !p.info.LastSeen.IsZero() && now.Sub(p.info.LastSeen) > 45*time.Second {
+			delete(a.peers, id)
+			changed = true
+			continue
+		}
+	}
+	a.mu.Unlock()
+
+	if changed {
+		a.emitPeerList()
+	}
+}
+
+func (a *App) emitPeerList() {
+	peers := a.GetPeers()
+	a.emit("peers", peers)
+}
+
+func (a *App) RemovePeer(peerID string) bool {
+	a.mu.Lock()
+	p, ok := a.peers[peerID]
+	if !ok {
+		a.mu.Unlock()
+		return false
+	}
+	if p.conn != nil {
+		_ = p.conn.Close()
+	}
+	delete(a.peers, peerID)
+	a.mu.Unlock()
+	a.emitPeerList()
+	return true
+}
+
+func extractHost(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
 }
 
 func (a *App) shutdown(context.Context) {
@@ -693,6 +805,7 @@ func (a *App) shutdown(context.Context) {
 	if listener != nil {
 		_ = listener.Close()
 	}
+	a.stopTray()
 	a.wg.Wait()
 }
 
@@ -706,10 +819,55 @@ func (a *App) GetPeers() []PeerInfo {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	result := make([]PeerInfo, 0, len(a.peers))
+	onlineNames := make(map[string]bool)
+	onlineHosts := make(map[string]bool)
 	for _, p := range a.peers {
-		result = append(result, a.peerSnapshotLocked(p))
+		if p.conn != nil {
+			if name := strings.TrimSpace(p.info.Name); name != "" {
+				onlineNames[strings.ToLower(name)] = true
+			}
+			if host := extractHost(p.info.Address); host != "" {
+				onlineHosts[host] = true
+			}
+		}
 	}
+
+	result := make([]PeerInfo, 0, len(a.peers))
+	seenNames := make(map[string]bool)
+
+	// First pass: add all connected peers
+	for _, p := range a.peers {
+		if p.conn != nil {
+			info := a.peerSnapshotLocked(p)
+			result = append(result, info)
+			if name := strings.TrimSpace(info.Name); name != "" {
+				seenNames[strings.ToLower(name)] = true
+			}
+		}
+	}
+
+	// Second pass: add unconnected peers only if not already online/represented
+	for _, p := range a.peers {
+		if p.conn == nil {
+			nameLower := strings.ToLower(strings.TrimSpace(p.info.Name))
+			host := extractHost(p.info.Address)
+			if nameLower != "" && (onlineNames[nameLower] || seenNames[nameLower]) {
+				continue
+			}
+			if host != "" && onlineHosts[host] {
+				continue
+			}
+			if strings.Contains(p.lastError, "fingerprint does not match") {
+				continue
+			}
+			info := a.peerSnapshotLocked(p)
+			result = append(result, info)
+			if nameLower != "" {
+				seenNames[nameLower] = true
+			}
+		}
+	}
+
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
 }
@@ -821,7 +979,12 @@ func (a *App) ManualConnect(address string) (PeerInfo, error) {
 	if err != nil {
 		return PeerInfo{}, err
 	}
-	authPayload, _ := json.Marshal(map[string]string{"id": a.identity.ID, "name": a.identity.Name, "fingerprint": a.identity.Fingerprint})
+	authPayload, _ := json.Marshal(map[string]string{
+		"id":          a.identity.ID,
+		"name":        a.identity.Name,
+		"fingerprint": a.identity.Fingerprint,
+		"avatar":      a.networkAvatar(),
+	})
 	if err := conn.SetDeadline(time.Now().Add(authHandshakeWindow)); err != nil {
 		_ = conn.Close()
 		return PeerInfo{}, err
@@ -847,6 +1010,7 @@ func (a *App) ManualConnect(address string) (PeerInfo, error) {
 		ID          string `json:"id"`
 		Name        string `json:"name"`
 		Fingerprint string `json:"fingerprint"`
+		Avatar      string `json:"avatar"`
 	}
 	if json.Unmarshal(response.Payload, &authData) != nil || authData.ID == "" || authData.Fingerprint == "" {
 		_ = conn.Close()
@@ -862,7 +1026,17 @@ func (a *App) ManualConnect(address string) (PeerInfo, error) {
 		_ = conn.Close()
 		return PeerInfo{}, errors.New("manual peer certificate fingerprint mismatch")
 	}
-	info := PeerInfo{ID: authData.ID, Name: authData.Name, Address: address, Fingerprint: authData.Fingerprint, Connected: true, Status: "online", LastSeen: time.Now(), Capabilities: []string{"chat", "files", "voice", "video", "screen"}}
+	info := PeerInfo{
+		ID:           authData.ID,
+		Name:         authData.Name,
+		Address:      address,
+		Fingerprint:  authData.Fingerprint,
+		Connected:    true,
+		Status:       "online",
+		LastSeen:     time.Now(),
+		Capabilities: []string{"chat", "files", "voice", "video", "screen"},
+		Avatar:       authData.Avatar,
+	}
 	// We placed this call, so we are the initiator for connection election.
 	if !a.installConnection(info, conn, a.identity.ID) {
 		_ = conn.Close()
@@ -880,6 +1054,7 @@ func (a *App) ManualConnect(address string) (PeerInfo, error) {
 		return PeerInfo{}, errors.New("an existing peer connection is preferred")
 	}
 	a.recordPeerResult(info.ID, nil)
+	a.startTracked(func() { a.sendAvatar(info.ID); a.sendPeerExchange(info.ID) })
 	if !a.startTracked(func() { a.readLoop(info.ID, conn, reader) }) {
 		_ = conn.Close()
 		return PeerInfo{}, errors.New("application is shutting down")
@@ -1144,6 +1319,51 @@ func (a *App) LoadChatHistory() string {
 	return string(data)
 }
 
+func channelsFilePath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	base := os.Getenv("APPDATA")
+	if base == "" {
+		base = filepath.Join(home, "AppData", "Roaming")
+	}
+	dir := filepath.Join(base, "inChat")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "channels.json"), nil
+}
+
+func (a *App) SaveChannels(data string) error {
+	path, err := channelsFilePath()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(data), 0600)
+}
+
+func (a *App) LoadChannels() string {
+	path, err := channelsFilePath()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func (a *App) syncAutoStart() {
+	a.mu.RLock()
+	enabled := a.settings.AutoStart
+	a.mu.RUnlock()
+	if enabled {
+		_ = a.SetAutoStart(true)
+	}
+}
+
 func (a *App) GetAutoStart() bool {
 	exePath, err := os.Executable()
 	if err != nil {
@@ -1159,13 +1379,17 @@ func (a *App) GetAutoStart() bool {
 	if err != nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(val), strings.ToLower(filepath.Base(exePath)))
+	cleanVal := strings.Trim(strings.TrimSpace(val), `"`)
+	return strings.EqualFold(filepath.Base(cleanVal), filepath.Base(exePath))
 }
 
 func (a *App) SetAutoStart(enabled bool) error {
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
 	if err != nil {
-		return err
+		k, _, err = registry.CreateKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
+		if err != nil {
+			return err
+		}
 	}
 	defer k.Close()
 
@@ -1174,12 +1398,20 @@ func (a *App) SetAutoStart(enabled bool) error {
 		if err != nil {
 			return err
 		}
-		return k.SetStringValue("inChat", fmt.Sprintf(`"%s"`, exePath))
+		err = k.SetStringValue("inChat", fmt.Sprintf(`"%s"`, exePath))
+	} else {
+		err = k.DeleteValue("inChat")
+		if err != nil && errors.Is(err, registry.ErrNotExist) {
+			err = nil
+		}
 	}
-	err = k.DeleteValue("inChat")
-	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+	if err != nil {
 		return err
 	}
+	a.mu.Lock()
+	a.settings.AutoStart = enabled
+	_ = saveSettings(a.settings)
+	a.mu.Unlock()
 	return nil
 }
 
@@ -1429,6 +1661,8 @@ func (a *App) GetDiagnostics() map[string]any {
 		"control_port":   controlPort,
 		"discovery_port": discoveryPort,
 		"webview":        "Wails WebView2",
+		"version":        appVersion,
+		"about":          "inChat Created by Setiawan @ 2026",
 	}
 }
 
@@ -1533,11 +1767,27 @@ func (a *App) installConnection(info PeerInfo, conn *tls.Conn, initiator string)
 	if hasConnection {
 		_ = existing.conn.Close()
 	}
+	if info.Avatar == "" && existing != nil && existing.info.Avatar != "" {
+		info.Avatar = existing.info.Avatar
+	}
 	info.Connected = true
 	info.Status = "online"
 	info.LastError = ""
 	info.LastSeen = time.Now()
 	a.peers[info.ID] = &peer{info: info, conn: conn, initiator: initiator, lastAttempt: time.Now()}
+
+	// Self-healing: auto-prune obsolete ghost records for this peer name or host
+	currentHost := extractHost(info.Address)
+	nameLower := strings.ToLower(strings.TrimSpace(info.Name))
+	for otherID, otherPeer := range a.peers {
+		if otherID != info.ID && otherPeer.conn == nil {
+			otherNameLower := strings.ToLower(strings.TrimSpace(otherPeer.info.Name))
+			otherHost := extractHost(otherPeer.info.Address)
+			if (nameLower != "" && otherNameLower == nameLower) || (currentHost != "" && otherHost == currentHost) {
+				delete(a.peers, otherID)
+			}
+		}
+	}
 	a.mu.Unlock()
 	return true
 }
@@ -1587,6 +1837,19 @@ func (a *App) connectPeer(info PeerInfo) error {
 		MinVersion:            tls.VersionTLS13,
 	})
 	if err != nil {
+		if strings.Contains(err.Error(), "peer certificate fingerprint does not match discovery record") {
+			// Remote peer regenerated certificate / reinstalled.
+			// Self-heal: remove the stale record from a.peers and auto-reconnect via ManualConnect!
+			a.mu.Lock()
+			delete(a.peers, info.ID)
+			a.mu.Unlock()
+			a.emitPeerList()
+			targetAddr := info.Address
+			a.startTracked(func() {
+				_, _ = a.ManualConnect(targetAddr)
+			})
+			return nil
+		}
 		a.recordPeerResult(info.ID, err)
 		return err
 	}
@@ -1595,6 +1858,7 @@ func (a *App) connectPeer(info PeerInfo) error {
 		"id":          a.identity.ID,
 		"name":        a.identity.Name,
 		"fingerprint": a.identity.Fingerprint,
+		"avatar":      a.networkAvatar(),
 	})
 	if err := conn.SetDeadline(time.Now().Add(authHandshakeWindow)); err != nil {
 		_ = conn.Close()
@@ -1624,6 +1888,16 @@ func (a *App) connectPeer(info PeerInfo) error {
 		return err
 	}
 
+	var okData struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Fingerprint string `json:"fingerprint"`
+		Avatar      string `json:"avatar"`
+	}
+	if json.Unmarshal(response.Payload, &okData) == nil && okData.Avatar != "" {
+		info.Avatar = okData.Avatar
+	}
+
 	if !a.installConnection(info, conn, a.identity.ID) {
 		_ = conn.Close()
 		a.recordPeerResult(info.ID, nil)
@@ -1632,6 +1906,7 @@ func (a *App) connectPeer(info PeerInfo) error {
 	// recordPeerResult already emits the authoritative "online" snapshot; do
 	// not emit the pre-install copy afterwards or the UI would flip back.
 	a.recordPeerResult(info.ID, nil)
+	a.startTracked(func() { a.sendAvatar(info.ID); a.sendPeerExchange(info.ID) })
 
 	if !a.startTracked(func() { a.readLoop(info.ID, conn, reader) }) {
 		_ = conn.Close()
@@ -1675,6 +1950,7 @@ func (a *App) handleIncoming(conn *tls.Conn) {
 		ID          string `json:"id"`
 		Name        string `json:"name"`
 		Fingerprint string `json:"fingerprint"`
+		Avatar      string `json:"avatar"`
 	}
 	if json.Unmarshal(auth.Payload, &authData) != nil || authData.ID == "" || authData.Fingerprint == "" {
 		return
@@ -1689,7 +1965,12 @@ func (a *App) handleIncoming(conn *tls.Conn) {
 		return
 	}
 
-	okPayload, _ := json.Marshal(map[string]string{"id": a.identity.ID, "name": a.identity.Name, "fingerprint": a.identity.Fingerprint})
+	okPayload, _ := json.Marshal(map[string]string{
+		"id":          a.identity.ID,
+		"name":        a.identity.Name,
+		"fingerprint": a.identity.Fingerprint,
+		"avatar":      a.networkAvatar(),
+	})
 	_ = writeLine(conn, mustMarshalEnvelope("auth-ok", a.identity.ID, authData.ID, okPayload))
 	// Clear the authentication deadline: the long-lived readLoop must not
 	// inherit it or it would drop the connection as soon as the window expires.
@@ -1709,6 +1990,7 @@ func (a *App) handleIncoming(conn *tls.Conn) {
 		Connected:    true,
 		LastSeen:     time.Now(),
 		Capabilities: []string{"chat", "files", "voice", "video", "screen"},
+		Avatar:       authData.Avatar,
 	}
 	// The remote device initiated this connection, so it is the initiator used
 	// for deterministic connection election on both sides.
@@ -1716,6 +1998,7 @@ func (a *App) handleIncoming(conn *tls.Conn) {
 		return
 	}
 	a.recordPeerResult(info.ID, nil)
+	a.startTracked(func() { a.sendAvatar(info.ID); a.sendPeerExchange(info.ID) })
 
 	a.readLoop(info.ID, conn, reader)
 }
@@ -1943,6 +2226,75 @@ func (a *App) handleEnvelope(peerID string, message envelope) {
 				"text":    pinData.Text,
 			})
 		}
+	case "avatar":
+		if len(message.Payload) > 256*1024 {
+			return
+		}
+		var av struct {
+			Data string `json:"data"`
+		}
+		if json.Unmarshal(message.Payload, &av) == nil && strings.HasPrefix(av.Data, "data:image/") {
+			a.mu.Lock()
+			peerName := ""
+			if p, ok := a.peers[peerID]; ok {
+				p.info.Avatar = av.Data
+				peerName = p.info.Name
+			}
+			a.mu.Unlock()
+			a.emit("avatar", map[string]any{"peer_id": peerID, "name": peerName, "data": av.Data})
+		}
+	case "get-avatar":
+		a.sendAvatar(peerID)
+	case "channel-invite":
+		if len(message.Payload) > 4*1024 {
+			return
+		}
+		var inv struct {
+			Channel    string `json:"channel"`
+			Passphrase string `json:"passphrase"`
+			FromName   string `json:"from_name"`
+			Creator    string `json:"creator"`
+		}
+		if json.Unmarshal(message.Payload, &inv) == nil && strings.TrimSpace(inv.Channel) != "" {
+			a.notify("Department room invite", fmt.Sprintf("%s invited you to %s", inv.FromName, inv.Channel))
+			a.emit("channel-invite", map[string]any{
+				"peer_id":    peerID,
+				"channel":    inv.Channel,
+				"passphrase": inv.Passphrase,
+				"from_name":  inv.FromName,
+				"creator":    inv.Creator,
+			})
+		}
+	case "peer-exchange":
+		if len(message.Payload) > 64*1024 {
+			return
+		}
+		var pex struct {
+			Peers []struct {
+				ID      string `json:"id"`
+				Name    string `json:"name"`
+				Address string `json:"address"`
+			} `json:"peers"`
+		}
+		if json.Unmarshal(message.Payload, &pex) == nil {
+			for _, item := range pex.Peers {
+				if item.ID == "" || item.ID == a.identity.ID || item.Address == "" {
+					continue
+				}
+				a.mu.RLock()
+				alreadyConnected := false
+				if existing, ok := a.peers[item.ID]; ok && existing.conn != nil {
+					alreadyConnected = true
+				}
+				a.mu.RUnlock()
+				if !alreadyConnected {
+					targetAddr := item.Address
+					a.startTracked(func() {
+						_, _ = a.ManualConnect(targetAddr)
+					})
+				}
+			}
+		}
 	case "channel-chat":
 		if len(message.Payload) > 64*1024 {
 			return
@@ -2001,6 +2353,21 @@ func (a *App) handleEnvelope(peerID string, message envelope) {
 		}
 		var signal signalPayload
 		if json.Unmarshal(message.Payload, &signal) == nil {
+			if signal.Kind == "offer" {
+				a.mu.RLock()
+				callerName := peerID
+				if p, ok := a.peers[peerID]; ok && strings.TrimSpace(p.info.Name) != "" {
+					callerName = p.info.Name
+				}
+				a.mu.RUnlock()
+				isVideo := strings.Contains(signal.Data, "m=video")
+				callLabel := "Panggilan Suara"
+				if isVideo {
+					callLabel = "Panggilan Video"
+				}
+				a.notify(callLabel+" Masuk", fmt.Sprintf("%s sedang memanggil Anda...", callerName))
+				a.showWindow()
+			}
 			a.emit("signal", map[string]any{"peer_id": peerID, "kind": signal.Kind, "data": signal.Data})
 		}
 	case "file-offer":

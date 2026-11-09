@@ -6,33 +6,12 @@ Unicode true
 ## If the keyword is not defined, "wails_tools.nsh" will populate them with the values from ProjectInfo.
 ## If they are defined here, "wails_tools.nsh" will not touch them. This allows to use this project.nsi manually
 ## from outside of Wails for debugging and development of the installer.
-##
-## For development first make a wails nsis build to populate the "wails_tools.nsh":
-## > wails build --target windows/amd64 --nsis
-## Then you can call makensis on this file with specifying the path to your binary:
-## For a AMD64 only installer:
-## > makensis -DARG_WAILS_AMD64_BINARY=..\..\bin\app.exe
-## For a ARM64 only installer:
-## > makensis -DARG_WAILS_ARM64_BINARY=..\..\bin\app.exe
-## For a installer with both architectures:
-## > makensis -DARG_WAILS_AMD64_BINARY=..\..\bin\app-amd64.exe -DARG_WAILS_ARM64_BINARY=..\..\bin\app-arm64.exe
-####
-## The following information is taken from the ProjectInfo file, but they can be overwritten here.
-####
-## !define INFO_PROJECTNAME    "MyProject" # Default "{{.Name}}"
-## !define INFO_COMPANYNAME    "MyCompany" # Default "{{.Info.CompanyName}}"
-## !define INFO_PRODUCTNAME    "MyProduct" # Default "{{.Info.ProductName}}"
-## !define INFO_PRODUCTVERSION "1.0.0"     # Default "{{.Info.ProductVersion}}"
-## !define INFO_COPYRIGHT      "Copyright" # Default "{{.Info.Copyright}}"
-###
-## !define PRODUCT_EXECUTABLE  "Application.exe"      # Default "${INFO_PROJECTNAME}.exe"
-## !define UNINST_KEY_NAME     "UninstKeyInRegistry"  # Default "${INFO_COMPANYNAME}${INFO_PRODUCTNAME}"
-####
-## !define REQUEST_EXECUTION_LEVEL "admin"            # Default "admin"  see also https://nsis.sourceforge.io/Docs/Chapter4.html
 ####
 ## Include the wails tools
 ####
 !include "wails_tools.nsh"
+!include "nsDialogs.nsh"
+!include "LogicLib.nsh"
 
 # The version information for this two must consist of 4 parts
 VIProductVersion "${INFO_PRODUCTVERSION}.0"
@@ -52,35 +31,270 @@ ManifestDPIAware true
 
 !define MUI_ICON "..\icon.ico"
 !define MUI_UNICON "..\icon.ico"
-# !define MUI_WELCOMEFINISHPAGE_BITMAP "resources\leftimage.bmp" #Include this to add a bitmap on the left side of the Welcome Page. Must be a size of 164x314
-!define MUI_FINISHPAGE_NOAUTOCLOSE # Wait on the INSTFILES page so the user can take a look into the details of the installation steps
-!define MUI_ABORTWARNING # This will warn the user if they exit from the installer.
+!define MUI_FINISHPAGE_NOAUTOCLOSE
+!define MUI_ABORTWARNING
 
-!insertmacro MUI_PAGE_WELCOME # Welcome to the installer page.
-# !insertmacro MUI_PAGE_LICENSE "resources\eula.txt" # Adds a EULA page to the installer
-!insertmacro MUI_PAGE_DIRECTORY # In which folder install page.
-!insertmacro MUI_PAGE_INSTFILES # Installing page.
-!insertmacro MUI_PAGE_FINISH # Finished installation page.
+# Variables for existing installation lifecycle
+Var IsAlreadyInstalled
+Var InstallMode       # "INSTALL", "UPDATE", "REINSTALL", "REMOVE"
+Var RemoveHistory     # "0" or "1"
+Var Dialog
+Var RadioUpdate
+Var RadioReinstall
+Var RadioRemove
+Var CheckRemoveHistory
+Var LabelUpdateNote
+Var LabelRemoveNote
 
-!insertmacro MUI_UNPAGE_INSTFILES # Uinstalling page
+!insertmacro MUI_PAGE_WELCOME
 
-!insertmacro MUI_LANGUAGE "English" # Set the Language of the installer
+# Custom Page: displayed if inChat is already installed
+Page custom PageExistingInstall PageExistingInstallLeave
 
-## The following two statements can be used to sign the installer and the uninstaller. The path to the binaries are provided in %1
-#!uninstfinalize 'signtool --file "%1"'
-#!finalize 'signtool --file "%1"'
+!define MUI_PAGE_CUSTOMFUNCTION_PRE DirectoryPre
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+!insertmacro MUI_UNPAGE_INSTFILES
+
+!insertmacro MUI_LANGUAGE "English"
+!insertmacro GetParent
 
 Name "${INFO_PRODUCTNAME}"
-OutFile "..\..\bin\${INFO_PROJECTNAME}-${ARCH}-installer.exe" # Name of the installer's file.
-InstallDir "$PROGRAMFILES64\${INFO_COMPANYNAME}\${INFO_PRODUCTNAME}" # Default installing folder ($PROGRAMFILES is Program Files folder).
-ShowInstDetails show # This will always show the installation details.
+OutFile "..\..\bin\${INFO_PROJECTNAME}-${ARCH}-installer.exe"
+InstallDir "$PROGRAMFILES64\${INFO_PRODUCTNAME}"
+ShowInstDetails show
 
 Function .onInit
-   !insertmacro wails.checkArchitecture
+    !insertmacro wails.checkArchitecture
+
+    StrCpy $IsAlreadyInstalled "0"
+    StrCpy $InstallMode "INSTALL"
+    StrCpy $RemoveHistory "0"
+
+    # Check 64-bit and 32-bit registry for existing installation under both inChat and inChatinChat keys
+    SetRegView 64
+    ReadRegStr $0 HKLM "${UNINST_KEY}" "UninstallString"
+    ${If} $0 == ""
+        ReadRegStr $0 HKCU "${UNINST_KEY}" "UninstallString"
+    ${EndIf}
+    ${If} $0 == ""
+        ReadRegStr $0 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\inChat" "UninstallString"
+    ${EndIf}
+    ${If} $0 == ""
+        ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\inChat" "UninstallString"
+    ${EndIf}
+
+    # Also check 32-bit registry view if not found yet
+    ${If} $0 == ""
+        SetRegView 32
+        ReadRegStr $0 HKLM "${UNINST_KEY}" "UninstallString"
+        ${If} $0 == ""
+            ReadRegStr $0 HKCU "${UNINST_KEY}" "UninstallString"
+        ${EndIf}
+        ${If} $0 == ""
+            ReadRegStr $0 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\inChat" "UninstallString"
+        ${EndIf}
+        ${If} $0 == ""
+            ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\inChat" "UninstallString"
+        ${EndIf}
+        SetRegView 64
+    ${EndIf}
+
+    ${If} $0 != ""
+        StrCpy $IsAlreadyInstalled "1"
+        ReadRegStr $1 HKLM "${UNINST_KEY}" "InstallLocation"
+        ${If} $1 == ""
+            ReadRegStr $1 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\inChat" "InstallLocation"
+        ${EndIf}
+        ${If} $1 != ""
+            StrCpy $INSTDIR $1
+        ${Else}
+            ReadRegStr $2 HKLM "${UNINST_KEY}" "DisplayIcon"
+            ${If} $2 == ""
+                ReadRegStr $2 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\inChat" "DisplayIcon"
+            ${EndIf}
+            ${If} $2 != ""
+                ${GetParent} "$2" $INSTDIR
+            ${EndIf}
+        ${EndIf}
+    ${Else}
+        # Fallback check files on disk across common install locations
+        IfFileExists "$INSTDIR\${PRODUCT_EXECUTABLE}" found_existing
+        IfFileExists "$PROGRAMFILES64\inChat\${PRODUCT_EXECUTABLE}" found_prog64
+        IfFileExists "$PROGRAMFILES\inChat\${PRODUCT_EXECUTABLE}" found_prog32
+        IfFileExists "$PROGRAMFILES64\inChat\inChat\${PRODUCT_EXECUTABLE}" found_nested
+        IfFileExists "$LOCALAPPDATA\Programs\inChat\${PRODUCT_EXECUTABLE}" found_local
+        Goto not_installed
+
+        found_prog64:
+            StrCpy $INSTDIR "$PROGRAMFILES64\inChat"
+            Goto found_existing
+        found_prog32:
+            StrCpy $INSTDIR "$PROGRAMFILES\inChat"
+            Goto found_existing
+        found_nested:
+            StrCpy $INSTDIR "$PROGRAMFILES64\inChat\inChat"
+            Goto found_existing
+        found_local:
+            StrCpy $INSTDIR "$LOCALAPPDATA\Programs\inChat"
+            Goto found_existing
+        found_existing:
+            StrCpy $IsAlreadyInstalled "1"
+        not_installed:
+    ${EndIf}
+FunctionEnd
+
+Function DirectoryPre
+    ${If} $InstallMode == "UPDATE"
+        Abort # Skip directory choice when updating existing installation
+    ${EndIf}
+FunctionEnd
+
+Function PageExistingInstall
+    ${If} $IsAlreadyInstalled != "1"
+        Abort # Skip this page for fresh install
+    ${EndIf}
+
+    nsDialogs::Create 1018
+    Pop $Dialog
+    ${If} $Dialog == error
+        Abort
+    ${EndIf}
+
+    !insertmacro MUI_HEADER_TEXT "Existing Installation Detected" "Choose whether to update, reinstall, or remove ${INFO_PRODUCTNAME}."
+
+    ${NSD_CreateLabel} 0 0 100% 24u "${INFO_PRODUCTNAME} is already installed on this computer.$\r$\nSelect how you would like to proceed:"
+    Pop $0
+
+    # 1. Update option
+    ${NSD_CreateRadioButton} 0 28u 100% 12u "&Update ${INFO_PRODUCTNAME} (Recommended)"
+    Pop $RadioUpdate
+    ${NSD_CreateLabel} 12u 42u 88% 18u "Updates application binaries to the newest version. All chat history, department rooms, and settings will remain untouched."
+    Pop $LabelUpdateNote
+
+    # 2. Reinstall option
+    ${NSD_CreateRadioButton} 0 64u 100% 12u "&Reinstall ${INFO_PRODUCTNAME}"
+    Pop $RadioReinstall
+    ${NSD_CreateCheckbox} 12u 78u 88% 12u "Remove chat history and user data (%APPDATA%\inChat)"
+    Pop $CheckRemoveHistory
+
+    # 3. Remove option
+    ${NSD_CreateRadioButton} 0 94u 100% 12u "Re&move (Uninstall) ${INFO_PRODUCTNAME}"
+    Pop $RadioRemove
+    ${NSD_CreateLabel} 12u 108u 88% 18u "Completely uninstalls ${INFO_PRODUCTNAME} and firewall rules from this computer."
+    Pop $LabelRemoveNote
+
+    # Default: Update checked, checkbox unchecked & disabled
+    ${NSD_Check} $RadioUpdate
+    ${NSD_Uncheck} $CheckRemoveHistory
+    EnableWindow $CheckRemoveHistory 0
+
+    ${NSD_OnClick} $RadioUpdate OnRadioUpdateClick
+    ${NSD_OnClick} $RadioReinstall OnRadioReinstallClick
+    ${NSD_OnClick} $RadioRemove OnRadioRemoveClick
+
+    nsDialogs::Show
+FunctionEnd
+
+Function OnRadioUpdateClick
+    Pop $0
+    ${NSD_Check} $RadioUpdate
+    ${NSD_Uncheck} $RadioReinstall
+    ${NSD_Uncheck} $RadioRemove
+    ${NSD_Uncheck} $CheckRemoveHistory
+    EnableWindow $CheckRemoveHistory 0
+FunctionEnd
+
+Function OnRadioReinstallClick
+    Pop $0
+    ${NSD_Uncheck} $RadioUpdate
+    ${NSD_Check} $RadioReinstall
+    ${NSD_Uncheck} $RadioRemove
+    EnableWindow $CheckRemoveHistory 1
+FunctionEnd
+
+Function OnRadioRemoveClick
+    Pop $0
+    ${NSD_Uncheck} $RadioUpdate
+    ${NSD_Uncheck} $RadioReinstall
+    ${NSD_Check} $RadioRemove
+    EnableWindow $CheckRemoveHistory 1
+FunctionEnd
+
+Function PageExistingInstallLeave
+    ${NSD_GetState} $RadioUpdate $0
+    ${If} $0 == ${BST_CHECKED}
+        StrCpy $InstallMode "UPDATE"
+        StrCpy $RemoveHistory "0"
+        Return
+    ${EndIf}
+
+    ${NSD_GetState} $RadioReinstall $0
+    ${If} $0 == ${BST_CHECKED}
+        StrCpy $InstallMode "REINSTALL"
+        ${NSD_GetState} $CheckRemoveHistory $1
+        ${If} $1 == ${BST_CHECKED}
+            StrCpy $RemoveHistory "1"
+        ${Else}
+            StrCpy $RemoveHistory "0"
+        ${EndIf}
+        Return
+    ${EndIf}
+
+    ${NSD_GetState} $RadioRemove $0
+    ${If} $0 == ${BST_CHECKED}
+        StrCpy $InstallMode "REMOVE"
+        ${NSD_GetState} $CheckRemoveHistory $1
+        ${If} $1 == ${BST_CHECKED}
+            StrCpy $RemoveHistory "1"
+        ${Else}
+            StrCpy $RemoveHistory "0"
+        ${EndIf}
+
+        MessageBox MB_YESNO|MB_ICONQUESTION "Are you sure you want to completely uninstall ${INFO_PRODUCTNAME}?" IDYES do_remove
+        Abort # User cancelled, stay on page
+
+        do_remove:
+        # Terminate running inChat before uninstalling
+        ExecWait 'taskkill /F /IM "${PRODUCT_EXECUTABLE}"'
+
+        ${If} $RemoveHistory == "1"
+            RMDir /r "$APPDATA\inChat"
+            RMDir /r "$LOCALAPPDATA\inChat"
+            RMDir /r "$APPDATA\${PRODUCT_EXECUTABLE}"
+        ${EndIf}
+
+        IfFileExists "$INSTDIR\uninstall.exe" 0 no_uninst
+            ExecWait '"$INSTDIR\uninstall.exe" /S _?=$INSTDIR'
+            Goto done_uninst
+        no_uninst:
+            RMDir /r "$INSTDIR"
+            Delete "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk"
+            Delete "$DESKTOP\${INFO_PRODUCTNAME}.lnk"
+            ExecWait 'netsh advfirewall firewall delete rule name="inChat Discovery"'
+            ExecWait 'netsh advfirewall firewall delete rule name="inChat Control"'
+            DeleteRegKey HKLM "${UNINST_KEY}"
+        done_uninst:
+            MessageBox MB_OK|MB_ICONINFORMATION "${INFO_PRODUCTNAME} has been uninstalled successfully."
+            Quit
+    ${EndIf}
 FunctionEnd
 
 Section
     !insertmacro wails.setShellContext
+
+    # Terminate running inChat instance before writing new binaries
+    DetailPrint "Closing running instances of inChat..."
+    ExecWait 'taskkill /F /IM "${PRODUCT_EXECUTABLE}"'
+
+    ${If} $RemoveHistory == "1"
+        DetailPrint "Removing chat history and user data as requested..."
+        RMDir /r "$APPDATA\inChat"
+        RMDir /r "$LOCALAPPDATA\inChat"
+        RMDir /r "$APPDATA\${PRODUCT_EXECUTABLE}"
+    ${EndIf}
 
     !insertmacro wails.webview2runtime
 
@@ -91,10 +305,12 @@ Section
     CreateShortcut "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
     CreateShortCut "$DESKTOP\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
 
+    # Auto-start on boot: register in HKCU Run key
+    DetailPrint "Configuring auto-start on Windows boot..."
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "inChat" '"$INSTDIR\${PRODUCT_EXECUTABLE}"'
+
     # Standard Windows Firewall: allow LAN discovery (UDP 45450) and the control
-    # channel (TCP 45451) for the installed binary. The installer already runs
-    # elevated, so no extra UAC prompt appears. Display names match the rules
-    # the in-app CheckFirewall/AllowFirewall helper looks for.
+    # channel (TCP 45451) for the installed binary.
     DetailPrint "Adding Windows Firewall rules for inChat..."
     ExecWait 'netsh advfirewall firewall delete rule name="inChat Discovery"'
     ExecWait 'netsh advfirewall firewall delete rule name="inChat Control"'
@@ -105,17 +321,37 @@ Section
     !insertmacro wails.associateCustomProtocols
 
     !insertmacro wails.writeUninstaller
+
+    # Also record InstallLocation in registry for reliable detection
+    SetRegView 64
+    WriteRegStr HKLM "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
 SectionEnd
 
 Section "uninstall"
     !insertmacro wails.setShellContext
 
-    RMDir /r "$AppData\${PRODUCT_EXECUTABLE}" # Remove the WebView2 DataPath
+    # Close running inChat if any
+    ExecWait 'taskkill /F /IM "${PRODUCT_EXECUTABLE}"'
 
+    # Ask user if they wish to remove chat history and user data
+    IfSilent skip_uninst_prompt
+    MessageBox MB_YESNO|MB_ICONQUESTION "Do you want to completely remove your chat history, department rooms, and user data (%APPDATA%\inChat)?" IDNO skip_remove_history
+    RMDir /r "$APPDATA\inChat"
+    RMDir /r "$LOCALAPPDATA\inChat"
+    RMDir /r "$AppData\${PRODUCT_EXECUTABLE}"
+    Goto skip_uninst_prompt
+
+    skip_remove_history:
+    DetailPrint "Keeping chat history, department rooms, and user settings."
+
+    skip_uninst_prompt:
     RMDir /r $INSTDIR
 
     Delete "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk"
     Delete "$DESKTOP\${INFO_PRODUCTNAME}.lnk"
+
+    # Remove auto-start from registry
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "inChat"
 
     # Remove the firewall rules the installer created.
     ExecWait 'netsh advfirewall firewall delete rule name="inChat Discovery"'

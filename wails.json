@@ -7,13 +7,13 @@
   "frontend:dev:watcher": "npm run dev",
   "frontend:dev:serverUrl": "auto",
   "author": {
-    "name": "inChat"
+    "name": "Setiawan"
   },
   "info": {
     "companyName": "inChat",
     "productName": "inChat",
     "productVersion": "0.1.0",
-    "copyright": "",
-    "comments": "Peer-to-peer LAN messenger"
+    "copyright": "Created by Setiawan @ 2026",
+    "comments": "inChat Created by Setiawan @ 2026"
   }
 }

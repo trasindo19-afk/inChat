@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"strings"
 	"testing"
 )
@@ -130,4 +131,56 @@ func TestChatHistoryRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPeerDeduplication(t *testing.T) {
+	app := &App{peers: make(map[string]*peer)}
 
+	// Add an online peer
+	app.peers["id-1"] = &peer{
+		info: PeerInfo{ID: "id-1", Name: "Fahlefi-Achmad", Address: "192.168.23.58:45451", Connected: true, Status: "online"},
+		conn: &tls.Conn{},
+	}
+	// Add an offline duplicate peer with the same name
+	app.peers["id-2"] = &peer{
+		info: PeerInfo{ID: "id-2", Name: "Fahlefi-Achmad", Address: "192.168.23.58:45451", Connected: false, Status: "discovered"},
+		conn: nil,
+	}
+	// Add a failed duplicate peer with fingerprint mismatch
+	app.peers["id-3"] = &peer{
+		info:      PeerInfo{ID: "id-3", Name: "Fahlefi-Achmad", Address: "192.168.23.58:45451", Connected: false, Status: "failed"},
+		lastError: "peer certificate fingerprint does not match discovery record",
+		conn:      nil,
+	}
+
+	peers := app.GetPeers()
+	if len(peers) != 1 {
+		t.Fatalf("expected exactly 1 deduplicated peer, got %d", len(peers))
+	}
+	if peers[0].ID != "id-1" {
+		t.Fatalf("expected online peer id-1, got %s", peers[0].ID)
+	}
+
+	// Now run pruneStalePeers()
+	app.pruneStalePeers()
+	if len(app.peers) != 1 {
+		t.Fatalf("expected pruneStalePeers to remove ghosts leaving 1 peer, got %d", len(app.peers))
+	}
+	if _, ok := app.peers["id-1"]; !ok {
+		t.Fatal("expected id-1 to remain in app.peers")
+	}
+}
+
+func TestChannelsRoundTrip(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("APPDATA", tempDir)
+
+	app := &App{}
+	sampleChannels := `[{"id":"dept-ga","name":"General Affair","description":"General affairs and facility","members":["peer-1","peer-2"]}]`
+	if err := app.SaveChannels(sampleChannels); err != nil {
+		t.Fatalf("save channels: %v", err)
+	}
+
+	loaded := app.LoadChannels()
+	if loaded != sampleChannels {
+		t.Fatalf("expected channels %q, got %q", sampleChannels, loaded)
+	}
+}

@@ -32,6 +32,7 @@ const state = {
   activeReactionMessageId: null,
   outbox: new Map(),
   channels: new Map(),
+  peerAvatars: (() => { try { return JSON.parse(window.localStorage.getItem('inchat.peer_avatars') || '{}'); } catch (_) { return {}; } })(),
   dlpEnabled: true
 };
 
@@ -349,11 +350,14 @@ async function init() {
 
   if (window.runtime?.EventsOn) {
     window.runtime.EventsOn('peer', (peer) => updatePeer(peer));
+    window.runtime.EventsOn('peers', (peers) => handlePeersList(peers));
     window.runtime.EventsOn('message', (payload) => receiveMessage(payload));
     window.runtime.EventsOn('chat-ack', (payload) => handleChatAck(payload));
     window.runtime.EventsOn('pong', (payload) => handlePong(payload));
     window.runtime.EventsOn('group-message', (payload) => receiveGroupMessage(payload));
     window.runtime.EventsOn('channel-message', (payload) => receiveChannelMessage(payload));
+    window.runtime.EventsOn('avatar', (payload) => handlePeerAvatar(payload));
+    window.runtime.EventsOn('channel-invite', (payload) => handleChannelInvite(payload));
     window.runtime.EventsOn('signal', (payload) => handleSignal(payload).catch((error) => showToast(error.message)));
     window.runtime.EventsOn('file', (payload) => receiveFile(payload));
     window.runtime.EventsOn('file-offer', (payload) => handleFileOffer(payload));
@@ -372,6 +376,25 @@ async function init() {
   await refreshPeers();
   setInterval(refreshPeers, 2000);
   refreshFirewallStatus();
+
+  // First initial launch auto-scan for enterprise VLANs
+  const initialVlanScanned = window.localStorage.getItem('inchat.initial_vlan_scanned');
+  if (!initialVlanScanned) {
+    window.localStorage.setItem('inchat.initial_vlan_scanned', 'true');
+    setTimeout(async () => {
+      try {
+        console.log('[VLAN] Performing first-launch initial VLAN scan...');
+        const res = await callApp('ScanAllVLANs', []);
+        const peerCount = res?.foundPeers?.length || 0;
+        if (peerCount > 0) {
+          showToast(`Multi-VLAN auto-scan: found ${peerCount} peer(s) across enterprise VLANs!`);
+          await refreshPeers();
+        }
+      } catch (err) {
+        console.warn('[VLAN] Initial scan error:', err);
+      }
+    }, 1500);
+  }
 }
 
 const peerStatusLine = (peer) => {
@@ -431,10 +454,47 @@ function bindEvents() {
   });
 
   $('lan-room-card').addEventListener('click', selectLanGroupRoom);
+
+  // Permanent event delegation for peer-list to prevent dropped clicks during periodic refresh
+  $('peer-list')?.addEventListener('click', (e) => {
+    const row = e.target.closest('[data-peer-id]');
+    if (row && row.dataset.peerId) {
+      selectPeer(row.dataset.peerId);
+    }
+  });
+
+  // Permanent event delegation for channel-list
+  $('channel-list')?.addEventListener('click', (e) => {
+    const delBtn = e.target.closest('[data-del-channel]');
+    if (delBtn && delBtn.dataset.delChannel) {
+      handleDeleteChannel(delBtn.dataset.delChannel, e);
+      return;
+    }
+    const row = e.target.closest('[data-channel-id]');
+    if (row && row.dataset.channelId) {
+      selectChannel(row.dataset.channelId);
+    }
+  });
+
   $('rename-button').addEventListener('click', renameDevice);
   $('add-peer-button').addEventListener('click', openConnectModal);
   $('export-chat-button').addEventListener('click', exportCurrentChat);
+  $('room-delete-header-btn').addEventListener('click', (e) => {
+    if (state.selectedPeer?.startsWith('__channel_')) {
+      handleDeleteChannel(state.selectedPeer, e);
+    }
+  });
+  $('room-members-header-btn')?.addEventListener('click', showMembersModal);
+  $('close-members-modal')?.addEventListener('click', () => $('members-modal').classList.add('hidden'));
+  $('close-members-btn')?.addEventListener('click', () => $('members-modal').classList.add('hidden'));
+  $('members-invite-btn')?.addEventListener('click', () => {
+    $('members-modal')?.classList.add('hidden');
+    openInviteModal();
+  });
   $('add-channel-button').addEventListener('click', openChannelModal);
+  $('room-invite-header-btn').addEventListener('click', openInviteModal);
+  $('close-invite-modal').addEventListener('click', () => $('invite-modal').classList.add('hidden'));
+  $('send-invites').addEventListener('click', sendInvites);
   $('close-channel-modal').addEventListener('click', closeChannelModal);
   $('confirm-join-channel').addEventListener('click', handleConfirmJoinChannel);
   $('close-connect').addEventListener('click', closeConnectModal);
@@ -450,6 +510,10 @@ function bindEvents() {
   $('choose-folder').addEventListener('click', chooseReceiveFolder);
   $('save-settings').addEventListener('click', saveSettings);
   $('check-update').addEventListener('click', checkForUpdates);
+  $('btn-rescan-vlans')?.addEventListener('click', rescanAllVLANs);
+  $('about-button')?.addEventListener('click', showAboutModal);
+  $('close-about')?.addEventListener('click', () => $('about-modal').classList.add('hidden'));
+  $('close-about-btn')?.addEventListener('click', () => $('about-modal').classList.add('hidden'));
   $('voice-button').addEventListener('click', () => startOutgoingCall(false));
   $('video-button').addEventListener('click', () => startOutgoingCall(true));
   $('group-button').addEventListener('click', startGroupCall);
@@ -466,6 +530,8 @@ function bindEvents() {
   $('copy-peer-info').addEventListener('click', () => copyText($('peer-info-text').textContent));
   $('accept-file').addEventListener('click', () => resolveFileOffer(true));
   $('reject-file').addEventListener('click', () => resolveFileOffer(false));
+  $('accept-call-btn').addEventListener('click', acceptIncomingCall);
+  $('decline-call-btn').addEventListener('click', declineIncomingCall);
   $('mute-button').addEventListener('click', toggleMute);
   $('camera-button').addEventListener('click', toggleCamera);
   $('screen-button').addEventListener('click', toggleScreenShare);
@@ -552,6 +618,8 @@ function bindEvents() {
       closeDoodleModal();
       cancelReply();
       $('settings-modal').classList.add('hidden');
+      $('about-modal')?.classList.add('hidden');
+      $('members-modal')?.classList.add('hidden');
       $('diagnostics-modal').classList.add('hidden');
       $('peer-modal').classList.add('hidden');
       $('connect-modal').classList.add('hidden');
@@ -561,6 +629,16 @@ function bindEvents() {
       cancelVoiceRecording();
     }
   });
+
+  // Scroll To Bottom Button & Smooth Auto-Scroll
+  $('scroll-bottom-btn')?.addEventListener('click', () => {
+    const list = $('message-list');
+    if (list) {
+      list.scrollTo({ top: list.scrollHeight, behavior: 'smooth' });
+    }
+  });
+  $('message-list')?.addEventListener('scroll', updateScrollBottomButton);
+  window.addEventListener('resize', () => scrollMessagesToBottom(false));
 }
 
 /* =========================================================================
@@ -844,13 +922,89 @@ async function sendDirectOrDataFile(file) {
 
 let pingInterval = null;
 
+function clearAllSelections() {
+  $('lan-room-card')?.classList.remove('selected');
+  document.querySelectorAll('.peer-row').forEach((r) => r.classList.remove('selected'));
+  document.querySelectorAll('.channel-row').forEach((r) => r.classList.remove('selected'));
+  document.querySelectorAll('.channel-row-wrapper').forEach((r) => r.classList.remove('selected'));
+}
+
+function getChannelMembers(ch) {
+  if (!ch) return [];
+  const membersMap = new Map();
+  const myId = state.identity?.id || 'local-me';
+  const myName = state.identity?.name || 'You';
+
+  // 1. Local user is always a member
+  const isMeCreator = !ch.creator || ch.creator === myId || ch.creator === myName || ch.creatorName === myName;
+  membersMap.set(myId, {
+    id: myId,
+    name: myName,
+    isCreator: isMeCreator,
+    isOnline: true,
+    isMe: true
+  });
+
+  // 2. Room creator if not me
+  if (ch.creator && ch.creator !== myId) {
+    const creatorName = ch.creatorName || 'Room Creator';
+    const creatorPeer = state.peers.get(ch.creator);
+    membersMap.set(ch.creator, {
+      id: ch.creator,
+      name: creatorPeer?.name || creatorName,
+      isCreator: true,
+      isOnline: Boolean(creatorPeer?.connected),
+      isMe: false
+    });
+  }
+
+  // 3. Members registered in channel record
+  if (Array.isArray(ch.members)) {
+    for (const m of ch.members) {
+      if (!m || !m.name) continue;
+      const peer = (m.id && state.peers.get(m.id)) || [...state.peers.values()].find((p) => p.name === m.name);
+      const id = m.id || peer?.id || m.name;
+      const isOnline = Boolean(peer?.connected);
+      const isCreator = m.isCreator || id === ch.creator || m.name === ch.creatorName;
+      if (!membersMap.has(id)) {
+        membersMap.set(id, {
+          id,
+          name: m.name,
+          isCreator,
+          isOnline,
+          isMe: id === myId || m.name === myName
+        });
+      }
+    }
+  }
+
+  // 4. Colleagues who sent messages in this channel
+  const chMessages = (state.messages.get ? state.messages.get(ch.id) : state.messages[ch.id]) || [];
+  for (const msg of chMessages) {
+    if (msg.senderName && msg.senderName !== myName) {
+      const peer = [...state.peers.values()].find((p) => p.name === msg.senderName);
+      const id = peer?.id || msg.senderName;
+      if (!membersMap.has(id)) {
+        membersMap.set(id, {
+          id,
+          name: msg.senderName,
+          isCreator: id === ch.creator || msg.senderName === ch.creatorName,
+          isOnline: Boolean(peer?.connected),
+          isMe: false
+        });
+      }
+    }
+  }
+
+  return [...membersMap.values()];
+}
+
 function selectLanGroupRoom() {
   state.selectedPeer = LAN_GROUP_ID;
   state.groupUnread = 0;
-  $('lan-room-badge').classList.add('hidden');
-  $('lan-room-card').classList.add('selected');
-  document.querySelectorAll('.peer-row').forEach((r) => r.classList.remove('selected'));
-  document.querySelectorAll('.channel-row').forEach((r) => r.classList.remove('selected'));
+  $('lan-room-badge')?.classList.add('hidden');
+  clearAllSelections();
+  $('lan-room-card')?.classList.add('selected');
 
   updateConversationHeader();
   renderMessages();
@@ -871,8 +1025,18 @@ function updateConversationHeader() {
     updatePinnedBanner();
     cancelReply();
     $('conversation-name').textContent = channel.name;
-    const roomSub = channel.creatorName ? `Department Room · Created by ${channel.creatorName}` : 'Department Room';
+    const convAvatar = $('conversation-avatar');
+    if (convAvatar) convAvatar.classList.add('hidden');
+
+    const myId = state.identity?.id;
+    const myName = state.identity?.name;
+    const isCreator = !channel.creator || channel.creator === myId || channel.creator === myName || channel.creatorName === myName;
+    const members = getChannelMembers(channel);
+    const memberCount = members.length;
+    const namesSummary = members.map((m) => m.name).slice(0, 3).join(', ') + (memberCount > 3 ? ` +${memberCount - 3}` : '');
+    const roomSub = `Department Room · ${memberCount} anggota: ${namesSummary}`;
     $('conversation-state').textContent = channel.passphrase ? `🔒 AES-256 GCM Encrypted · ${roomSub}` : roomSub;
+    $('conversation-state').title = `Anggota: ${members.map((m) => m.name + (m.isCreator ? ' (Creator)' : '')).join(', ')}`;
     $('conversation-state').classList.remove('state-failed');
     $('conversation-ping').classList.add('hidden');
     $('voice-button').classList.add('hidden');
@@ -880,8 +1044,32 @@ function updateConversationHeader() {
     $('rdp-button').classList.add('hidden');
     $('group-button').classList.add('hidden');
     $('peer-info-button').classList.add('hidden');
+
+    const membersBtn = $('room-members-header-btn');
+    if (membersBtn) {
+      membersBtn.classList.remove('hidden');
+      $('room-members-count').textContent = memberCount;
+      membersBtn.title = `Lihat anggota room (${memberCount})`;
+    }
+
+    const headerBtn = $('room-delete-header-btn');
+    $('room-invite-header-btn')?.classList.toggle('hidden', !isCreator);
+    if (headerBtn) {
+      headerBtn.classList.remove('hidden');
+      if (isCreator) {
+        headerBtn.textContent = '🗑️';
+        headerBtn.title = 'Delete Department Room (Creator)';
+      } else {
+        headerBtn.textContent = '✕';
+        headerBtn.title = 'Leave Room';
+      }
+    }
     return;
   }
+
+  $('room-members-header-btn')?.classList.add('hidden');
+  $('room-delete-header-btn')?.classList.add('hidden');
+  $('room-invite-header-btn')?.classList.add('hidden');
 
   updatePinnedBanner();
   cancelReply();
@@ -907,6 +1095,12 @@ function updateConversationHeader() {
   $('peer-info-button').classList.remove('hidden');
 
   $('conversation-name').textContent = peer.name || 'Unknown device';
+  const convAvatar = $('conversation-avatar');
+  if (convAvatar) {
+    convAvatar.innerHTML = peerAvatarInner(peer);
+    convAvatar.classList.remove('hidden');
+  }
+
   const stateLine = peerStatusLine(peer);
   $('conversation-state').textContent = peer.connected ? 'online · direct connection' : stateLine;
   $('conversation-state').classList.toggle('state-failed', peer.status === 'failed');
@@ -942,9 +1136,30 @@ function handlePong(payload) {
   }
 }
 
+function cachePeerAvatars(peers = []) {
+  if (!Array.isArray(peers)) return;
+  for (const p of peers) {
+    if (p.avatar && p.avatar.startsWith('data:image/')) {
+      state.peerAvatars[p.id] = p.avatar;
+      if (p.name) state.peerAvatars[p.name.trim().toLowerCase()] = p.avatar;
+    }
+  }
+}
+
+function handlePeersList(peers) {
+  if (!Array.isArray(peers)) return;
+  cachePeerAvatars(peers);
+  state.peers = new Map(peers.map((peer) => [peer.id, peer]));
+  renderPeers();
+  if (state.selectedPeer && state.peers.has(state.selectedPeer)) {
+    updateConversationHeader();
+  }
+}
+
 async function refreshPeers() {
   try {
     const peers = await callApp('GetPeers');
+    cachePeerAvatars(peers);
     state.peers = new Map(peers.map((peer) => [peer.id, peer]));
     renderPeers();
     setNetworkStatus(true);
@@ -969,6 +1184,10 @@ async function connectManualPeer() {
   if (!address?.trim()) return;
   try {
     const peer = await callApp('ManualConnect', address.trim());
+    if (peer.avatar && peer.avatar.startsWith('data:image/')) {
+      state.peerAvatars[peer.id] = peer.avatar;
+      if (peer.name) state.peerAvatars[peer.name.trim().toLowerCase()] = peer.avatar;
+    }
     state.peers.set(peer.id, peer);
     renderPeers();
     showToast(`Connected to ${peer.name || peer.address}`);
@@ -978,6 +1197,10 @@ async function connectManualPeer() {
 }
 
 function updatePeer(peer) {
+  if (peer.avatar && peer.avatar.startsWith('data:image/')) {
+    state.peerAvatars[peer.id] = peer.avatar;
+    if (peer.name) state.peerAvatars[peer.name.trim().toLowerCase()] = peer.avatar;
+  }
   state.peers.set(peer.id, peer);
   renderPeers();
   if (state.selectedPeer === peer.id || state.selectedPeer === LAN_GROUP_ID || state.selectedPeer?.startsWith('__channel_')) {
@@ -988,38 +1211,246 @@ function updatePeer(peer) {
   }
 }
 
+let lastRenderedPeersSignature = '';
+
 function renderPeers() {
   const list = $('peer-list');
-  const peers = [...state.peers.values()].sort((a, b) => Number(b.connected) - Number(a.connected) || a.name.localeCompare(b.name));
+  const rawPeers = [...state.peers.values()];
+
+  // Self-healing deduplication by peer name:
+  // If an online entry exists for a name, suppress any offline/failed ghost duplicates.
+  const onlinePeers = rawPeers.filter((p) => p.connected);
+  const onlineNames = new Set(onlinePeers.map((p) => (p.name || '').trim().toLowerCase()));
+
+  const deduplicated = [];
+  const seenNames = new Set();
+
+  // 1. Online peers take top precedence
+  for (const peer of onlinePeers) {
+    const key = (peer.name || '').trim().toLowerCase();
+    if (key) seenNames.add(key);
+    deduplicated.push(peer);
+  }
+
+  // 2. Add unconnected peers only if no online peer of the same name exists,
+  //    and skip stale certificate mismatch error records
+  for (const peer of rawPeers.filter((p) => !p.connected)) {
+    const key = (peer.name || '').trim().toLowerCase();
+    if (key && (onlineNames.has(key) || seenNames.has(key))) {
+      continue; // Skip ghost duplicate!
+    }
+    if (peer.status === 'failed' && (peer.lastError || '').includes('fingerprint')) {
+      continue; // Skip stale certificate mismatch
+    }
+    if (key) seenNames.add(key);
+    deduplicated.push(peer);
+  }
+
+  const peers = deduplicated.sort((a, b) => Number(b.connected) - Number(a.connected) || a.name.localeCompare(b.name));
   $('peer-count').textContent = peers.length;
 
-  const onlineCount = peers.filter((p) => p.connected).length;
+  const onlineCount = onlinePeers.length;
   $('lan-room-status').textContent = `Local broadcast · ${onlineCount} online`;
 
   if (!peers.length) {
+    lastRenderedPeersSignature = 'empty';
     list.innerHTML = '<div class="empty-state">Looking for peers on your LAN…<br>Make sure both devices are on the same network.</div>';
     return;
   }
+
+  // Content signature excluding selected state
+  const contentSignature = peers.map((p) => `${p.id}:${p.name}:${p.connected}:${p.status}:${p.lastError || ''}:${p.avatar ? '1' : '0'}`).join('|');
+
+  if (lastRenderedPeersSignature === contentSignature) {
+    // Fast update of selection class only, avoiding DOM rebuilding & lost clicks
+    list.querySelectorAll('.peer-row').forEach((btn) => {
+      btn.classList.toggle('selected', btn.dataset.peerId === state.selectedPeer);
+    });
+    return;
+  }
+
+  lastRenderedPeersSignature = contentSignature;
   list.innerHTML = peers.map((peer) => `
     <button class="peer-row ${peer.id === state.selectedPeer ? 'selected' : ''}" data-peer-id="${escapeHtml(peer.id)}">
-      <span class="peer-avatar">${escapeHtml(initials(peer.name))}<span class="dot ${peer.connected ? 'green' : ''}" style="position:absolute;right:-1px;bottom:1px;border:2px solid #0f172a"></span></span>
+      <span class="peer-avatar">${peerAvatarInner(peer)}<span class="dot ${peer.connected ? 'green' : ''}" style="position:absolute;right:-1px;bottom:1px;border:2px solid #0f172a"></span></span>
       <span class="peer-copy"><strong>${escapeHtml(peer.name || 'Unknown device')}</strong><small class="${peer.status === 'failed' ? 'status-failed' : ''}" title="${escapeHtml(peer.lastError || '')}">${escapeHtml(peerStatusLine(peer))}</small></span>
     </button>`).join('');
+}
 
-  list.querySelectorAll('[data-peer-id]').forEach((button) => {
-    button.addEventListener('click', () => selectPeer(button.dataset.peerId));
+function peerAvatarInner(peer) {
+  const nameKey = (peer?.name || '').trim().toLowerCase();
+  const data = peer?.avatar || state.peerAvatars[peer?.id] || (nameKey ? state.peerAvatars[nameKey] : null);
+  if (data && data.startsWith('data:image/')) {
+    return `<img class="peer-avatar-img" src="${escapeHtml(data)}" alt="" />`;
+  }
+  return escapeHtml(initials(peer?.name));
+}
+
+function handlePeerAvatar(payload) {
+  if (!payload?.peer_id || !payload.data) return;
+  state.peerAvatars[payload.peer_id] = payload.data;
+  if (payload.name) {
+    state.peerAvatars[payload.name.trim().toLowerCase()] = payload.data;
+  }
+  const peer = state.peers.get(payload.peer_id);
+  if (peer) {
+    peer.avatar = payload.data;
+  }
+  try {
+    window.localStorage.setItem('inchat.peer_avatars', JSON.stringify(state.peerAvatars));
+  } catch (_) {}
+  renderPeers();
+  if (state.selectedPeer === payload.peer_id || (peer && state.selectedPeer === peer.name)) {
+    updateConversationHeader();
+  }
+}
+
+/* ---- Department room invites & members ---- */
+
+function openInviteModal() {
+  const ch = state.channels.get(state.selectedPeer);
+  if (!ch) return;
+  $('invite-room-name').textContent = ch.name;
+  const online = [...state.peers.values()].filter((p) => p.connected);
+  const list = $('invite-peer-list');
+  if (!online.length) {
+    list.innerHTML = '<div class="channel-empty">No colleagues online right now.</div>';
+  } else {
+    list.innerHTML = online.map((p) => `
+      <label class="invite-row">
+        <input type="checkbox" value="${escapeHtml(p.id)}" />
+        <span class="peer-avatar">${peerAvatarInner(p)}</span>
+        <span>${escapeHtml(p.name || 'Unknown device')}</span>
+      </label>`).join('');
+  }
+  $('invite-modal').classList.remove('hidden');
+}
+
+async function sendInvites() {
+  const ch = state.channels.get(state.selectedPeer);
+  if (!ch) return;
+  const ids = [...$('invite-peer-list').querySelectorAll('input:checked')].map((i) => i.value);
+  if (!ids.length) return showToast('Select at least one colleague');
+  if (!Array.isArray(ch.members)) ch.members = [];
+  let sent = 0;
+  for (const id of ids) {
+    try {
+      await callApp('SendChannelInvite', id, ch.name, ch.passphrase || '');
+      sent++;
+      const peer = state.peers.get(id);
+      const peerName = peer?.name || id;
+      if (!ch.members.some((m) => m.id === id || m.name === peerName)) {
+        ch.members.push({ id, name: peerName, isCreator: false });
+      }
+    } catch (_) {}
+  }
+  saveChannels();
+  renderChannels();
+  updateConversationHeader();
+  $('invite-modal').classList.add('hidden');
+  showToast(`Invitation sent to ${sent} colleague${sent === 1 ? '' : 's'}`);
+}
+
+async function handleChannelInvite(payload) {
+  const name = (payload?.channel || '').trim().replace(/^#+\s*/, '').slice(0, 40);
+  if (!name) return;
+  const channelId = `__channel_${name.toLowerCase().replace(/[^a-z0-9_-]/g, '_') || name.toLowerCase()}__`;
+  if (state.channels.has(channelId)) return;
+  const who = payload.from_name || 'A colleague';
+  if (!confirm(`${who} invited you to the department room "${name}"${payload.passphrase ? ' (encrypted)' : ''}.\n\nJoin now?`)) return;
+  let key = null;
+  if (payload.passphrase) {
+    try { key = await deriveChannelKey(payload.passphrase, name); } catch (_) {}
+  }
+  state.channels.set(channelId, {
+    id: channelId,
+    name,
+    passphrase: payload.passphrase || '',
+    key,
+    unread: 0,
+    creator: payload.creator || payload.peer_id || '',
+    creatorName: who,
+    members: [
+      { id: payload.creator || payload.peer_id || '', name: who, isCreator: true }
+    ],
+    createdAt: Date.now()
   });
+  saveChannels();
+  renderChannels();
+  selectChannel(channelId);
+  showToast(`Joined department room "${name}"`);
+}
+
+function showMembersModal() {
+  const ch = state.channels.get(state.selectedPeer);
+  if (!ch) return;
+  const titleEl = $('members-room-name');
+  if (titleEl) titleEl.textContent = ch.name;
+  const members = getChannelMembers(ch);
+  const myId = state.identity?.id;
+  const myName = state.identity?.name;
+  const isCreator = !ch.creator || ch.creator === myId || ch.creator === myName || ch.creatorName === myName;
+
+  const list = $('members-room-list');
+  if (list) {
+    if (!members.length) {
+      list.innerHTML = '<div class="channel-empty">Belum ada anggota.</div>';
+    } else {
+      list.innerHTML = members.map((m) => {
+        const peerObj = (m.id && state.peers.get(m.id)) || [...state.peers.values()].find((p) => p.name === m.name);
+        const isOnline = m.isMe || Boolean(peerObj?.connected);
+        const avatarHtml = m.isMe
+          ? (state.identity?.avatar && state.identity.avatar.startsWith('data:image/')
+              ? `<img class="peer-avatar-img" src="${escapeHtml(state.identity.avatar)}" alt="" />`
+              : escapeHtml(initials(state.identity?.name || 'You')))
+          : peerAvatarInner(peerObj || { name: m.name });
+
+        const roleBadge = m.isCreator
+          ? '<span class="room-member-role creator" title="Pembuat Room">👑 Creator</span>'
+          : '<span class="room-member-role member">👤 Anggota</span>';
+
+        const statusBadge = isOnline
+          ? '<span class="room-member-status online"><span class="dot green"></span> Online</span>'
+          : '<span class="room-member-status offline"><span class="dot"></span> Offline</span>';
+
+        return `
+          <div class="room-member-item">
+            <div class="room-member-info">
+              <span class="peer-avatar">${avatarHtml}</span>
+              <div>
+                <div class="room-member-name">${escapeHtml(m.name)}${m.isMe ? ' <small style="color:var(--text-muted)">(Anda)</small>' : ''}</div>
+                <div style="font-size:12px;color:var(--text-muted)">${statusBadge}</div>
+              </div>
+            </div>
+            <div>${roleBadge}</div>
+          </div>
+        `;
+      }).join('');
+    }
+  }
+
+  const inviteBtn = $('members-invite-btn');
+  if (inviteBtn) {
+    inviteBtn.style.display = isCreator ? 'inline-flex' : 'none';
+  }
+  $('members-modal')?.classList.remove('hidden');
 }
 
 function selectPeer(peerId) {
   state.selectedPeer = peerId;
-  $('lan-room-card').classList.remove('selected');
-  document.querySelectorAll('.channel-row').forEach((r) => r.classList.remove('selected'));
+  clearAllSelections();
+  const safeId = window.CSS?.escape ? CSS.escape(peerId) : peerId.replace(/"/g, '\\"');
+  const targetPeerBtn = document.querySelector(`.peer-row[data-peer-id="${safeId}"]`);
+  targetPeerBtn?.classList.add('selected');
   renderPeers();
   renderChannels();
   updateConversationHeader();
   renderMessages();
   callApp('ConnectPeer', peerId).catch((error) => showToast(error.message));
+  const p = state.peers.get(peerId);
+  if (!p?.avatar && !state.peerAvatars[peerId]) {
+    callApp('RequestAvatar', peerId).catch(() => {});
+  }
 }
 
 /* =========================================================================
@@ -1076,6 +1507,7 @@ function renderMessages() {
     if (m.kind === 'file') return renderFileMessage(m);
     if (m.kind === 'image') return renderImageMessage(m);
     if (m.kind === 'audio') return renderAudioMessage(m);
+    if (m.kind === 'call') return renderCallMessage(m);
     return renderTextMessage(m);
   }).join('');
 
@@ -1169,7 +1601,41 @@ function renderMessages() {
     }
   });
 
-  list.scrollTop = list.scrollHeight;
+  // Scroll handling
+  scrollMessagesToBottom(true);
+
+  // If any inline images are loading, scroll again on load
+  list.querySelectorAll('img').forEach((img) => {
+    if (!img.complete) {
+      img.addEventListener('load', () => {
+        scrollMessagesToBottom(false);
+      }, { once: true });
+    }
+  });
+}
+
+function scrollMessagesToBottom(force = true) {
+  const list = $('message-list');
+  if (!list) return;
+  const isNearBottom = (list.scrollHeight - list.scrollTop - list.clientHeight) < 220;
+  if (force || isNearBottom) {
+    requestAnimationFrame(() => {
+      list.scrollTop = list.scrollHeight;
+      updateScrollBottomButton();
+    });
+  }
+}
+
+function updateScrollBottomButton() {
+  const list = $('message-list');
+  const btn = $('scroll-bottom-btn');
+  if (!list || !btn) return;
+  const distance = list.scrollHeight - list.scrollTop - list.clientHeight;
+  if (distance > 180) {
+    btn.classList.remove('hidden');
+  } else {
+    btn.classList.add('hidden');
+  }
 }
 
 function renderTextMessage(message) {
@@ -1264,6 +1730,37 @@ function renderFileMessage(message) {
       </div>
       ${reactionsHtml}
       <small class="message-time">${message.time}</small>
+    </div>`;
+}
+
+function renderCallMessage(message) {
+  const icon = message.isVideo ? '📹' : '📞';
+  const isMissed = message.callStatus === 'missed' || message.callStatus === 'declined';
+  let desc = '';
+  if (message.callStatus === 'outgoing') {
+    desc = `Panggilan ${message.isVideo ? 'video' : 'suara'} keluar`;
+  } else if (message.callStatus === 'incoming') {
+    desc = `Panggilan ${message.isVideo ? 'video' : 'suara'} masuk`;
+  } else if (message.callStatus === 'missed') {
+    desc = `Panggilan ${message.isVideo ? 'video' : 'suara'} tak terjawab`;
+  } else if (message.callStatus === 'declined') {
+    desc = `Panggilan ${message.isVideo ? 'video' : 'suara'} ditolak`;
+  } else if (message.callStatus === 'ended') {
+    const dur = message.duration ? ` (${message.duration})` : '';
+    desc = `Panggilan ${message.isVideo ? 'video' : 'suara'} selesai${dur}`;
+  } else {
+    desc = message.text || `Panggilan ${message.isVideo ? 'video' : 'suara'}`;
+  }
+
+  return `
+    <div class="message call-message ${message.mine ? 'mine' : ''}" data-msg-id="${escapeHtml(message.id || '')}">
+      <div class="message-bubble call-bubble ${isMissed ? 'call-missed' : ''}">
+        <span class="call-icon ${isMissed ? 'call-icon-missed' : ''}">${icon}</span>
+        <div class="call-details">
+          <div class="call-text">${escapeHtml(desc)}</div>
+          <small class="call-subtext">${message.time}</small>
+        </div>
+      </div>
     </div>`;
 }
 
@@ -1713,10 +2210,22 @@ async function applySettingsToUI() {
   $('auto-accept-files').checked = Boolean(state.settings.autoAcceptFiles);
   $('sound-notifications').checked = state.settings.soundNotifications !== false;
 
-  try {
-    const autoStart = await callApp('GetAutoStart');
-    $('auto-start-boot').checked = Boolean(autoStart);
-  } catch (_) {}
+  const autoStartCheck = $('auto-start-boot');
+  if (autoStartCheck) {
+    try {
+      const autoStart = await callApp('GetAutoStart');
+      autoStartCheck.checked = Boolean(autoStart);
+    } catch (_) {}
+
+    autoStartCheck.onchange = async () => {
+      try {
+        await callApp('SetAutoStart', autoStartCheck.checked);
+        showToast(autoStartCheck.checked ? 'Auto-start aktif saat Windows boot' : 'Auto-start dinonaktifkan');
+      } catch (err) {
+        showToast('Gagal mengubah pengaturan auto-start: ' + err.message);
+      }
+    };
+  }
 
   applyAvatar($('local-avatar'), state.settings.avatarData);
   applyAvatar($('settings-avatar-preview'), state.settings.avatarData);
@@ -1733,6 +2242,54 @@ async function applySettingsToUI() {
   const appPin = window.localStorage.getItem('inchat.app_pin') || '';
   state.appPin = appPin;
   $('settings-pin').value = appPin;
+
+  const vlanInput = $('settings-vlan-subnets');
+  if (vlanInput) {
+    vlanInput.value = (state.settings.knownSubnets || []).join(', ');
+  }
+  renderResponsiveVLANs(state.settings.knownSubnets || []);
+}
+
+function renderResponsiveVLANs(subnets = []) {
+  const container = $('vlan-responsive-list');
+  if (!container) return;
+  if (!subnets || subnets.length === 0) {
+    container.innerHTML = '<span class="vlan-tag empty">Belum ada VLAN. Klik "Scan Ulang All VLANs" untuk memindai.</span>';
+    return;
+  }
+  container.innerHTML = subnets.map((s) => `<span class="vlan-tag active" title="Responsive VLAN Subnet">🟢 ${escapeHtml(s)}</span>`).join('');
+}
+
+async function rescanAllVLANs() {
+  const btn = $('btn-rescan-vlans');
+  const indicator = $('vlan-scan-indicator');
+  const statusText = $('vlan-scan-status-text');
+  if (btn) btn.disabled = true;
+  if (indicator) indicator.classList.remove('hidden');
+  if (statusText) statusText.textContent = 'Memindai candidate VLANs & subnets jaringan…';
+
+  try {
+    const rawInput = $('settings-vlan-subnets')?.value || '';
+    const userSubnets = rawInput.split(',').map((s) => s.trim()).filter(Boolean);
+    const result = await callApp('ScanAllVLANs', userSubnets);
+
+    state.settings = await callApp('GetSettings');
+    applySettingsToUI();
+
+    const count = result?.foundPeers?.length || 0;
+    const vlanCount = result?.responsiveSubnets?.length || 0;
+    showToast(`Scan VLAN Selesai: ${count} peer ditemukan di ${vlanCount} VLAN aktif!`, 5000);
+  } catch (err) {
+    showToast(`Scan VLAN gagal: ${err.message || err}`, 5000);
+  } finally {
+    if (btn) btn.disabled = false;
+    if (indicator) indicator.classList.add('hidden');
+  }
+}
+
+function showAboutModal() {
+  $('about-brand-icon').src = appIcon;
+  $('about-modal').classList.remove('hidden');
 }
 
 async function showSettings() {
@@ -1799,6 +2356,12 @@ async function saveSettings() {
 
     try { await callApp('SetAutoStart', autoStart); } catch (_) {}
 
+    const vlanInput = $('settings-vlan-subnets');
+    if (vlanInput) {
+      const subnets = vlanInput.value.split(',').map((s) => s.trim()).filter(Boolean);
+      try { await callApp('SetKnownSubnets', subnets); } catch (_) {}
+    }
+
     state.privacyShield = $('privacy-shield').checked;
     window.localStorage.setItem('inchat.privacy_shield', state.privacyShield ? 'true' : 'false');
 
@@ -1838,20 +2401,255 @@ async function launchRDP() {
    Calls & WebRTC Signaling
    ========================================================================= */
 
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' }
+  ],
+  iceCandidatePoolSize: 0
+};
+
+const pendingIceCandidatesByPeer = new Map();
+let incomingCallInfo = null;
+let incomingCallTimeout = null;
+let callTimerInterval = null;
+
+async function acquireMediaStream(withVideo) {
+  let stream = null;
+  let hasVideo = false;
+
+  if (withVideo) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: { width: { ideal: 1280, max: 1920 }, height: { ideal: 720, max: 1080 } }
+      });
+      hasVideo = true;
+    } catch (e1) {
+      console.warn('High-res video stream failed, trying basic video...', e1);
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        hasVideo = true;
+      } catch (e2) {
+        console.warn('Webcam not available or permission denied, falling back to audio only...', e2);
+        showToast('Kamera tidak terdeteksi atau izin ditolak. Beralih ke panggilan audio.');
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        } catch (e3) {
+          throw new Error('Mikrofon tidak dapat diakses: ' + e3.message);
+        }
+      }
+    }
+  } else {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false
+      });
+    } catch (e) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      } catch (e2) {
+        throw new Error('Mikrofon tidak dapat diakses: ' + e2.message);
+      }
+    }
+  }
+
+  return { stream, hasVideo };
+}
+
+function sanitizeCandidateForPeer(peerId, candidateObj) {
+  if (!candidateObj || !candidateObj.candidate) return candidateObj;
+  const peer = state.peers.get(peerId);
+  const knownIp = peer?.address || (peer?.addresses && peer.addresses[0]);
+  if (knownIp && typeof candidateObj.candidate === 'string' && candidateObj.candidate.includes('.local')) {
+    const parts = candidateObj.candidate.split(' ');
+    if (parts.length >= 5 && parts[4].endsWith('.local')) {
+      parts[4] = knownIp;
+      return {
+        ...candidateObj,
+        candidate: parts.join(' ')
+      };
+    }
+  }
+  return candidateObj;
+}
+
+async function addOrQueueIceCandidate(peerId, candidate) {
+  if (!candidate) return;
+  const targetPeer = peerId || state.activeCallPeer;
+  if (!targetPeer) return;
+
+  const sanitized = sanitizeCandidateForPeer(targetPeer, candidate);
+
+  if (state.pc && state.pc.remoteDescription && state.activeCallPeer === targetPeer) {
+    try {
+      await state.pc.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (err) {
+      console.warn('Failed to add candidate, trying sanitized LAN candidate:', err);
+      if (sanitized && sanitized.candidate !== candidate.candidate) {
+        try {
+          await state.pc.addIceCandidate(new RTCIceCandidate(sanitized));
+        } catch (_) {}
+      }
+    }
+    return;
+  }
+
+  if (!pendingIceCandidatesByPeer.has(targetPeer)) {
+    pendingIceCandidatesByPeer.set(targetPeer, []);
+  }
+  pendingIceCandidatesByPeer.get(targetPeer).push(candidate);
+  if (sanitized && sanitized.candidate !== candidate.candidate) {
+    pendingIceCandidatesByPeer.get(targetPeer).push(sanitized);
+  }
+}
+
+async function flushPendingIceCandidates(peerId) {
+  const targetPeer = peerId || state.activeCallPeer;
+  if (!state.pc || !state.pc.remoteDescription || !targetPeer) return;
+  const list = pendingIceCandidatesByPeer.get(targetPeer) || [];
+  pendingIceCandidatesByPeer.delete(targetPeer);
+  for (const c of list) {
+    try {
+      await state.pc.addIceCandidate(new RTCIceCandidate(c));
+    } catch (err) {
+      console.warn('Failed to flush candidate:', err);
+    }
+  }
+}
+
+function appendCallMessage(peerId, { callStatus, isVideo, duration, mine = false, text }) {
+  const msg = {
+    id: 'call-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+    kind: 'call',
+    callStatus,
+    isVideo: Boolean(isVideo),
+    duration: duration || null,
+    mine,
+    text: text || '',
+    time: formatTime()
+  };
+  addMessage(peerId, msg);
+}
+
+function startCallTimer() {
+  stopCallTimer();
+  updateCallTimerDisplay();
+  callTimerInterval = setInterval(updateCallTimerDisplay, 1000);
+}
+
+function stopCallTimer() {
+  if (callTimerInterval) {
+    clearInterval(callTimerInterval);
+    callTimerInterval = null;
+  }
+}
+
+function updateCallTimerDisplay() {
+  if (!state.callConnectedAt) return;
+  const sec = Math.floor((Date.now() - state.callConnectedAt) / 1000);
+  const mins = Math.floor(sec / 60);
+  const remSec = sec % 60;
+  const timeStr = `${mins.toString().padStart(2, '0')}:${remSec.toString().padStart(2, '0')}`;
+  const el = $('call-status');
+  if (el) el.textContent = timeStr;
+}
+
+function showIncomingCallModal(peer, offer, withVideo) {
+  incomingCallInfo = { peerId: peer.id, offer, withVideo, peer };
+
+  const avatarEl = $('incoming-call-avatar');
+  if (peer.avatar) {
+    avatarEl.innerHTML = `<img src="${peer.avatar}" alt="${escapeHtml(peer.name)}" class="peer-avatar-img">`;
+  } else {
+    avatarEl.textContent = initials(peer.name || 'P');
+  }
+
+  $('incoming-call-caller').textContent = peer.name || 'Rekan LAN';
+  $('incoming-call-type').textContent = withVideo ? '📹 Panggilan Video Masuk…' : '📞 Panggilan Suara Masuk…';
+  $('incoming-call-modal').classList.remove('hidden');
+
+  startRingTone();
+
+  if (incomingCallTimeout) clearTimeout(incomingCallTimeout);
+  incomingCallTimeout = setTimeout(() => {
+    if (incomingCallInfo) {
+      stopRingTone();
+      $('incoming-call-modal').classList.add('hidden');
+      const missedPeerId = incomingCallInfo.peerId;
+      const missedVideo = incomingCallInfo.withVideo;
+      incomingCallInfo = null;
+      callApp('SendSignal', missedPeerId, 'hangup', JSON.stringify({ reason: 'timeout' })).catch(() => {});
+      appendCallMessage(missedPeerId, {
+        callStatus: 'missed',
+        isVideo: missedVideo,
+        mine: false
+      });
+    }
+  }, 45000);
+}
+
+async function acceptIncomingCall() {
+  if (!incomingCallInfo) return;
+  stopRingTone();
+  if (incomingCallTimeout) {
+    clearTimeout(incomingCallTimeout);
+    incomingCallTimeout = null;
+  }
+  $('incoming-call-modal').classList.add('hidden');
+  const info = incomingCallInfo;
+  incomingCallInfo = null;
+
+  try {
+    const { stream, hasVideo } = await acquireMediaStream(info.withVideo);
+    await ensureCall(info.peerId, hasVideo, stream);
+    await state.pc.setRemoteDescription(new RTCSessionDescription(info.offer));
+    await flushPendingIceCandidates(info.peerId);
+    const answer = await state.pc.createAnswer();
+    await state.pc.setLocalDescription(answer);
+    await callApp('SendSignal', info.peerId, 'answer', JSON.stringify(answer));
+    openCallPanel(info.peer, hasVideo);
+  } catch (error) {
+    await endCall();
+    showToast(`Panggilan gagal tersambung: ${error.message}`);
+  }
+}
+
+async function declineIncomingCall() {
+  if (!incomingCallInfo) return;
+  stopRingTone();
+  if (incomingCallTimeout) {
+    clearTimeout(incomingCallTimeout);
+    incomingCallTimeout = null;
+  }
+  $('incoming-call-modal').classList.add('hidden');
+  const info = incomingCallInfo;
+  incomingCallInfo = null;
+
+  callApp('SendSignal', info.peerId, 'hangup', JSON.stringify({ reason: 'declined' })).catch(() => {});
+  appendCallMessage(info.peerId, {
+    callStatus: 'declined',
+    isVideo: info.withVideo,
+    mine: true
+  });
+}
+
 async function startGroupCall() {
-  if (state.pc || state.group) return showToast('Another call is already active');
+  if (state.pc || state.group) return showToast('Panggilan lain sedang berlangsung');
   const connectedPeers = [...state.peers.values()].filter((peer) => peer.connected);
-  if (connectedPeers.length < 1) return showToast('At least one connected peer is needed for a call');
+  if (connectedPeers.length < 1) return showToast('Diperlukan setidaknya satu rekan yang terhubung untuk panggilan grup');
 
   const participants = [state.identity?.id, ...connectedPeers.map((peer) => peer.id)].slice(0, 5);
   const names = participants
     .filter((id) => id !== state.identity?.id)
     .map((id) => state.peers.get(id)?.name || 'Unknown device')
     .join(', ');
-  if (!window.confirm(`Start group call with ${names}?`)) return;
+  if (!window.confirm(`Mulai panggilan grup dengan ${names}?`)) return;
 
   try {
-    state.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: { ideal: 1280 }, height: { ideal: 720 } } });
+    const { stream } = await acquireMediaStream(true);
+    state.localStream = stream;
     state.cameraTrack = state.localStream.getVideoTracks()[0] || null;
     $('local-video').srcObject = state.localStream;
     state.group = { id: `g-${Date.now()}-${Math.random().toString(16).slice(2)}`, host: state.identity?.id, participants, pcs: new Map() };
@@ -1867,14 +2665,14 @@ async function startGroupCall() {
     await createGroupOffers();
   } catch (error) {
     await endCall();
-    showToast(`Group call failed: ${error.message}`);
+    showToast(`Panggilan grup gagal: ${error.message}`);
   }
 }
 
 async function createGroupPeerConnection(peerId) {
   const group = state.group;
   if (!group || group.pcs.has(peerId)) return group?.pcs.get(peerId);
-  const pc = new RTCPeerConnection({ iceServers: [] });
+  const pc = new RTCPeerConnection(RTC_CONFIG);
   group.pcs.set(peerId, pc);
   pc.onicecandidate = async (event) => {
     if (state.group?.id !== group.id || !event.candidate) return;
@@ -1906,6 +2704,7 @@ async function createGroupOffers() {
 }
 
 function openGroupCallPanel() {
+  document.querySelector('.workspace')?.classList.add('has-call-panel');
   document.querySelector('.video-stage').classList.add('group-mode');
   $('call-panel').classList.remove('hidden');
   $('call-title').textContent = `Group call · ${state.group.participants.length} people`;
@@ -1937,15 +2736,16 @@ async function acceptGroupInvite(payload) {
   const data = JSON.parse(payload.data);
   if (state.pc || state.group) return;
   const participants = [...new Set(data.participants || [])];
-  if (!participants.includes(payload.peer_id) || !participants.includes(state.identity.id)) return showToast('Invalid group call invitation');
+  if (!participants.includes(payload.peer_id) || !participants.includes(state.identity.id)) return showToast('Undangan panggilan grup tidak valid');
 
   startRingTone();
-  const accept = window.confirm(`Accept group call from ${state.peers.get(payload.peer_id)?.name || 'peer'}?`);
+  const accept = window.confirm(`Terima panggilan grup dari ${state.peers.get(payload.peer_id)?.name || 'rekan'}?`);
   stopRingTone();
   if (!accept) return;
 
   try {
-    state.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: { ideal: 1280 }, height: { ideal: 720 } } });
+    const { stream } = await acquireMediaStream(true);
+    state.localStream = stream;
     state.cameraTrack = state.localStream.getVideoTracks()[0] || null;
     $('local-video').srcObject = state.localStream;
     state.group = { id: data.call_id, host: payload.peer_id, participants, pcs: new Map() };
@@ -1956,7 +2756,7 @@ async function acceptGroupInvite(payload) {
     await createGroupOffers();
   } catch (error) {
     await endCall();
-    showToast(`Could not join group call: ${error.message}`);
+    showToast(`Tidak dapat bergabung ke panggilan grup: ${error.message}`);
   }
 }
 
@@ -1984,47 +2784,83 @@ async function handleGroupSignal(payload) {
 }
 
 async function startOutgoingCall(withVideo) {
-  if (!state.selectedPeer || state.selectedPeer === LAN_GROUP_ID) return showToast('Select a direct peer first');
+  if (!state.selectedPeer || state.selectedPeer === LAN_GROUP_ID) return showToast('Pilih rekan chat terlebih dahulu');
   const peer = state.peers.get(state.selectedPeer);
-  if (!peer?.connected) return showToast('Peer is still connecting');
+  if (!peer?.connected) return showToast('Rekan belum terhubung atau sedang offline');
   try {
-    await ensureCall(peer.id, withVideo);
+    const { stream, hasVideo } = await acquireMediaStream(withVideo);
+    await ensureCall(peer.id, hasVideo, stream);
     const offer = await state.pc.createOffer();
     await state.pc.setLocalDescription(offer);
     await callApp('SendSignal', peer.id, 'offer', JSON.stringify(offer));
-    openCallPanel(peer, withVideo);
+    openCallPanel(peer, hasVideo);
+    appendCallMessage(peer.id, {
+      callStatus: 'outgoing',
+      isVideo: hasVideo,
+      mine: true
+    });
   } catch (error) {
     await endCall();
-    showToast(`Call failed: ${error.message}`);
+    showToast(`Panggilan gagal: ${error.message}`);
   }
 }
 
-async function ensureCall(peerId, withVideo) {
+async function ensureCall(peerId, withVideo, stream) {
   await endCall(false);
   state.activeCallPeer = peerId;
   state.startedAt = Date.now();
-  const pc = new RTCPeerConnection({ iceServers: [] });
+  state.callWithVideo = withVideo;
+  state.callConnectedAt = null;
+
+  const pc = new RTCPeerConnection(RTC_CONFIG);
   state.pc = pc;
+
   pc.onicecandidate = async (event) => {
     if (state.pc !== pc) return;
-    if (event.candidate) await callApp('SendSignal', peerId, 'candidate', JSON.stringify(event.candidate.toJSON()));
+    if (event.candidate) {
+      await callApp('SendSignal', peerId, 'candidate', JSON.stringify(event.candidate.toJSON())).catch(() => {});
+    }
   };
+
   pc.ontrack = (event) => {
     if (state.pc !== pc) return;
-    $('remote-video').srcObject = event.streams[0];
-    $('call-placeholder').classList.add('hidden');
+    const remoteEl = $('remote-video');
+    if (remoteEl) {
+      remoteEl.srcObject = event.streams[0];
+      remoteEl.play().catch((e) => console.warn('remote-video play error:', e));
+    }
+    if (state.callWithVideo) {
+      $('call-placeholder').classList.add('hidden');
+    } else {
+      $('call-placeholder').classList.remove('hidden');
+      $('call-placeholder').textContent = `📞 Terhubung · ${state.peers.get(peerId)?.name || 'Panggilan Suara'}`;
+    }
   };
+
   pc.onconnectionstatechange = () => {
-    if (state.pc === pc) $('call-status').textContent = pc.connectionState;
+    if (state.pc !== pc) return;
+    const s = pc.connectionState;
+    if (s === 'connected') {
+      state.callConnectedAt = Date.now();
+      startCallTimer();
+      showToast(`Panggilan tersambung (${state.callWithVideo ? 'Video' : 'Suara'})`);
+    } else if (s === 'disconnected' || s === 'failed' || s === 'closed') {
+      stopCallTimer();
+      $('call-status').textContent = s;
+      if (s === 'failed') {
+        showToast('Koneksi panggilan terputus/gagal');
+        endCall();
+      }
+    } else {
+      $('call-status').textContent = s + '…';
+    }
   };
-  if (withVideo) {
-    state.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: { ideal: 1280 }, height: { ideal: 720 } } });
-  } else {
-    state.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-  }
+
+  state.localStream = stream;
   state.localStream.getTracks().forEach((track) => {
     const sender = pc.addTrack(track, state.localStream);
     if (track.kind === 'video') state.videoSender = sender;
+    if (track.kind === 'audio') state.audioSender = sender;
   });
   state.cameraTrack = state.localStream.getVideoTracks()[0] || null;
   $('local-video').srcObject = state.localStream;
@@ -2035,42 +2871,61 @@ async function handleSignal(payload) {
   if (!peer) return;
   if (payload.kind.startsWith('group-')) return handleGroupSignal(payload);
   if (state.activeCallPeer && state.activeCallPeer !== payload.peer_id) return;
+
   if (payload.kind === 'offer') {
-    startRingTone();
-    const accept = window.confirm(`Accept ${peer.name || 'peer'} incoming call?`);
-    stopRingTone();
-    if (!accept) {
-      callApp('SendSignal', payload.peer_id, 'hangup', JSON.stringify({ reason: 'declined' })).catch(() => {});
-      return;
-    }
     const offer = JSON.parse(payload.data);
     const withVideo = Boolean(offer.sdp?.includes('m=video'));
-    await ensureCall(payload.peer_id, withVideo);
-    await state.pc.setRemoteDescription(offer);
-    const answer = await state.pc.createAnswer();
-    await state.pc.setLocalDescription(answer);
-    await callApp('SendSignal', payload.peer_id, 'answer', JSON.stringify(answer));
-    openCallPanel(peer, withVideo);
+    appendCallMessage(payload.peer_id, {
+      callStatus: 'incoming',
+      isVideo: withVideo,
+      mine: false
+    });
+    showIncomingCallModal(peer, offer, withVideo);
   } else if (payload.kind === 'answer' && state.pc) {
-    await state.pc.setRemoteDescription(JSON.parse(payload.data));
-  } else if (payload.kind === 'candidate' && state.pc) {
-    await state.pc.addIceCandidate(JSON.parse(payload.data));
+    const answer = JSON.parse(payload.data);
+    await state.pc.setRemoteDescription(new RTCSessionDescription(answer));
+    await flushPendingIceCandidates(payload.peer_id);
+  } else if (payload.kind === 'candidate') {
+    const candidate = JSON.parse(payload.data);
+    await addOrQueueIceCandidate(payload.peer_id, candidate);
   } else if (payload.kind === 'hangup') {
     stopRingTone();
+    if (incomingCallTimeout) {
+      clearTimeout(incomingCallTimeout);
+      incomingCallTimeout = null;
+    }
+    if (incomingCallInfo && incomingCallInfo.peerId === payload.peer_id) {
+      $('incoming-call-modal').classList.add('hidden');
+      const missedVideo = incomingCallInfo.withVideo;
+      incomingCallInfo = null;
+      appendCallMessage(payload.peer_id, {
+        callStatus: 'missed',
+        isVideo: missedVideo,
+        mine: false
+      });
+    }
     await endCall();
-    showToast(`${peer.name || 'Peer'} ended the call`);
+    showToast(`${peer.name || 'Rekan'} mengakhiri panggilan`);
   }
 }
 
 function openCallPanel(peer, withVideo) {
+  document.querySelector('.workspace')?.classList.add('has-call-panel');
   document.querySelector('.video-stage').classList.remove('group-mode');
   $('call-panel').classList.remove('hidden');
-  $('call-title').textContent = peer.name || 'Peer';
-  $('call-status').textContent = 'connecting…';
+  $('call-title').textContent = peer.name || 'Rekan';
+  $('call-status').textContent = 'menghubungkan…';
   $('camera-button').classList.toggle('hidden', !withVideo);
   $('screen-button').classList.remove('hidden');
   $('screen-button').disabled = !withVideo;
-  $('screen-button').title = withVideo ? 'Share screen' : 'Screen sharing requires a video call';
+  $('screen-button').title = withVideo ? 'Bagikan layar' : 'Berbagi layar memerlukan panggilan video';
+  if (!withVideo) {
+    $('call-placeholder').classList.remove('hidden');
+    $('call-placeholder').textContent = `📞 Panggilan Suara · ${peer.name || 'Rekan'}`;
+  } else {
+    $('call-placeholder').classList.remove('hidden');
+    $('call-placeholder').textContent = `📹 Menghubungkan Kamera · ${peer.name || 'Rekan'}`;
+  }
 }
 
 async function toggleMute() {
@@ -2117,12 +2972,37 @@ async function toggleScreenShare() {
     $('screen-button').classList.add('active');
     $('screen-button').textContent = 'Stop';
   } catch (error) {
-    showToast(`Screen sharing was not started: ${error.message}`);
+    showToast(`Berbagi layar gagal: ${error.message}`);
   }
 }
 
 async function endCall(closePanel = true) {
   stopRingTone();
+  stopCallTimer();
+  if (incomingCallTimeout) {
+    clearTimeout(incomingCallTimeout);
+    incomingCallTimeout = null;
+  }
+  $('incoming-call-modal')?.classList.add('hidden');
+  incomingCallInfo = null;
+
+  const currentPeerId = state.activeCallPeer;
+  const connectedAt = state.callConnectedAt;
+  const isVideo = state.callWithVideo;
+
+  if (currentPeerId && connectedAt) {
+    const sec = Math.floor((Date.now() - connectedAt) / 1000);
+    const mins = Math.floor(sec / 60);
+    const remSec = sec % 60;
+    const durStr = `${mins.toString().padStart(2, '0')}:${remSec.toString().padStart(2, '0')}`;
+    appendCallMessage(currentPeerId, {
+      callStatus: 'ended',
+      duration: durStr,
+      isVideo,
+      mine: true
+    });
+  }
+
   if (state.group) {
     const group = state.group;
     for (const peerId of group.participants) {
@@ -2143,6 +3023,11 @@ async function endCall(closePanel = true) {
   state.screenTrack?.stop();
   state.pc = null;
   state.activeCallPeer = null;
+  state.callConnectedAt = null;
+  state.callWithVideo = false;
+  if (currentPeerId) {
+    pendingIceCandidatesByPeer.delete(currentPeerId);
+  }
   state.localStream?.getTracks().forEach((track) => track.stop());
   state.localStream = null;
   state.cameraTrack = null;
@@ -2152,7 +3037,8 @@ async function endCall(closePanel = true) {
   $('remote-video').srcObject = null;
   $('local-video').srcObject = null;
   document.querySelector('.video-stage').classList.remove('group-mode');
-  $('call-placeholder').textContent = 'Voice call';
+  $('call-placeholder').textContent = 'Panggilan Suara';
+  document.querySelector('.workspace')?.classList.remove('has-call-panel');
   if (closePanel) $('call-panel').classList.add('hidden');
 }
 
@@ -2686,6 +3572,7 @@ function renderChannels() {
     const isSelected = state.selectedPeer === id;
     const badge = ch.unread > 0 ? `<span class="channel-badge">${ch.unread}</span>` : '';
     const lockIcon = ch.passphrase ? '<span class="channel-lock" title="AES-256 GCM Encrypted">🔒</span>' : '';
+    const memberCount = getChannelMembers(ch).length;
     
     // Creator check: if creator matches local ID/name or if not recorded (legacy local room)
     const isCreator = !ch.creator || ch.creator === myId || ch.creator === myName || ch.creatorName === myName;
@@ -2697,7 +3584,7 @@ function renderChannels() {
       <div class="channel-row-wrapper ${isSelected ? 'selected' : ''}">
         <button class="channel-row ${isSelected ? 'selected' : ''}" data-channel-id="${escapeHtml(id)}">
           <span class="channel-icon" title="Department Room">🏢</span>
-          <span class="channel-name" title="${escapeHtml(ch.name)}${ch.creatorName ? ' (Created by ' + escapeHtml(ch.creatorName) + ')' : ''}">${escapeHtml(ch.name)}</span>
+          <span class="channel-name" title="${escapeHtml(ch.name)}${ch.creatorName ? ' (Created by ' + escapeHtml(ch.creatorName) + ')' : ''}">${escapeHtml(ch.name)} <span class="channel-count-badge">(${memberCount})</span></span>
           ${lockIcon}
           ${badge}
         </button>
@@ -2706,12 +3593,6 @@ function renderChannels() {
     `);
   }
   container.innerHTML = html.join('');
-  container.querySelectorAll('[data-channel-id]').forEach((btn) => {
-    btn.addEventListener('click', () => selectChannel(btn.dataset.channelId));
-  });
-  container.querySelectorAll('[data-del-channel]').forEach((btn) => {
-    btn.addEventListener('click', (e) => handleDeleteChannel(btn.dataset.delChannel, e));
-  });
 }
 
 async function handleDeleteChannel(channelId, e) {
@@ -2758,8 +3639,12 @@ function selectChannel(channelId) {
   if (channel) {
     channel.unread = 0;
   }
-  $('lan-room-card').classList.remove('selected');
-  document.querySelectorAll('.peer-row').forEach((r) => r.classList.remove('selected'));
+  clearAllSelections();
+  const safeId = window.CSS?.escape ? CSS.escape(channelId) : channelId.replace(/"/g, '\\"');
+  const wrapper = document.querySelector(`[data-channel-id="${safeId}"]`)?.closest('.channel-row-wrapper');
+  wrapper?.classList.add('selected');
+  const btn = document.querySelector(`[data-channel-id="${safeId}"]`);
+  btn?.classList.add('selected');
   renderChannels();
   updateConversationHeader();
   renderMessages();
@@ -2782,8 +3667,8 @@ async function handleConfirmJoinChannel() {
   if (!rawInput) {
     return showToast('Please enter a room name');
   }
-  // Sanitize control characters and collapse whitespace, preserving natural casing and symbols (&, -, etc.)
-  const cleanName = rawInput.replace(/[\x00-\x1F\x7F]/g, '').replace(/\s+/g, ' ').slice(0, 40);
+  // Strip leading '#' if entered, sanitize control characters, collapse whitespace, preserve natural casing & symbols
+  const cleanName = rawInput.replace(/^#+\s*/, '').replace(/[\x00-\x1F\x7F]/g, '').replace(/\s+/g, ' ').slice(0, 40);
   if (!cleanName) {
     return showToast('Please enter a valid room name');
   }
@@ -2810,6 +3695,9 @@ async function handleConfirmJoinChannel() {
     unread: 0,
     creator: state.identity?.id || state.identity?.name || '',
     creatorName: state.identity?.name || 'Local User',
+    members: [
+      { id: state.identity?.id || 'local-me', name: state.identity?.name || 'Local User', isCreator: true }
+    ],
     createdAt: Date.now()
   };
   state.channels.set(channelId, chObj);
@@ -2829,46 +3717,92 @@ function saveChannels() {
       passphrase: ch.passphrase,
       creator: ch.creator || '',
       creatorName: ch.creatorName || '',
+      members: Array.isArray(ch.members) ? ch.members : [],
       createdAt: ch.createdAt || Date.now()
     });
   }
+  const jsonStr = JSON.stringify(list);
   try {
-    window.localStorage.setItem('inchat.channels.v2', JSON.stringify(list));
+    window.localStorage.setItem('inchat.channels.v2', jsonStr);
   } catch (_) {}
+  // Persist directly to %APPDATA%\inChat\channels.json so rooms are NEVER lost across updates
+  callApp('SaveChannels', jsonStr).catch(() => {});
 }
 
 async function loadChannels() {
+  let raw = null;
+  // 1. Try Go backend persistent storage first (%APPDATA%\inChat\channels.json)
   try {
-    const raw = window.localStorage.getItem('inchat.channels.v2');
-    if (raw) {
+    const backendData = await callApp('LoadChannels');
+    if (backendData && backendData.trim().length > 2) {
+      raw = backendData;
+    }
+  } catch (_) {}
+
+  // 2. Fallback to localStorage keys (v2, v1, or legacy inchat.channels)
+  if (!raw) {
+    try {
+      raw = window.localStorage.getItem('inchat.channels.v2') ||
+            window.localStorage.getItem('inchat.channels.v1') ||
+            window.localStorage.getItem('inchat.channels');
+    } catch (_) {}
+  }
+
+  if (raw) {
+    try {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         for (const item of parsed) {
+          if (!item || !item.name) continue;
+          const cleanName = (item.name || '').replace(/^#+\s*/, '');
           let key = null;
           if (item.passphrase) {
             try {
-              key = await deriveChannelKey(item.passphrase, item.name);
+              key = await deriveChannelKey(item.passphrase, cleanName);
             } catch (_) {}
           }
           state.channels.set(item.id, {
             id: item.id,
-            name: item.name,
+            name: cleanName,
             passphrase: item.passphrase || '',
             key,
             unread: 0,
             creator: item.creator || '',
             creatorName: item.creatorName || '',
+            members: Array.isArray(item.members) ? item.members : [],
             createdAt: item.createdAt || Date.now()
           });
         }
       }
+    } catch (_) {}
+  }
+
+  // 3. Self-healing fallback: scan state.messages or chat history for any department channels!
+  // If the user had conversations in __channel_xxx__, restore the room automatically!
+  for (const [convId] of state.messages) {
+    if (typeof convId === 'string' && convId.startsWith('__channel_') && !state.channels.has(convId)) {
+      const rawName = convId.replace(/^__channel_/, '').replace(/__$/, '');
+      const prettyName = rawName.replace(/_/g, ' ');
+      state.channels.set(convId, {
+        id: convId,
+        name: prettyName,
+        passphrase: '',
+        key: null,
+        unread: 0,
+        creator: '',
+        creatorName: '',
+        members: [],
+        createdAt: Date.now()
+      });
     }
-  } catch (_) {}
+  }
+
+  saveChannels();
   renderChannels();
 }
 
 async function receiveChannelMessage(payload) {
-  const rawChannelName = (payload.channel || '').trim();
+  const rawChannelName = (payload.channel || '').trim().replace(/^#+\s*/, '');
   if (!rawChannelName) return;
 
   const normalizedSlug = rawChannelName.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
@@ -2901,6 +3835,7 @@ async function receiveChannelMessage(payload) {
       unread: 0,
       creator: payload.peer_id || payload.sender || '',
       creatorName: payload.name || '',
+      members: payload.name ? [{ id: payload.peer_id || payload.sender || '', name: payload.name, isCreator: true }] : [],
       createdAt: Date.now()
     });
     saveChannels();
@@ -2908,6 +3843,24 @@ async function receiveChannelMessage(payload) {
   }
 
   const ch = state.channels.get(channelId);
+  if (ch && payload.name) {
+    if (!Array.isArray(ch.members)) ch.members = [];
+    const senderName = payload.name;
+    const senderId = payload.peer_id || payload.sender || '';
+    if (!ch.members.some((m) => (senderId && m.id === senderId) || m.name === senderName)) {
+      ch.members.push({
+        id: senderId,
+        name: senderName,
+        isCreator: senderId === ch.creator || senderName === ch.creatorName
+      });
+      saveChannels();
+      renderChannels();
+      if (state.selectedPeer === channelId) {
+        updateConversationHeader();
+      }
+    }
+  }
+
   let decryptedText = payload.text;
   let isEncrypted = false;
   if (payload.text && payload.text.startsWith('__ENC__:')) {
